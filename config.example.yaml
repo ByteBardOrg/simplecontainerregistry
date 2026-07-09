@@ -1,0 +1,26 @@
+http:
+  address: "0.0.0.0"
+  port: 5000
+
+storage:
+  rootDirectory: "/var/lib/scr/registry"
+  commit: true
+  gc: true
+  gcDelay: "1h"
+  gcInterval: "24h"
+
+database:
+  driver: "sqlite"
+  dsn: "/var/lib/scr/scr.db"
+
+auth:
+  issuer: "scr"
+  service: "scr"
+  tokenTTL: "10m"
+
+# Prefer environment variables for real deployments:
+# SCR_BOOTSTRAP_ADMIN_USERNAME
+# SCR_BOOTSTRAP_ADMIN_PASSWORD
+# bootstrap:
+#   adminUsername: "admin"
+#   adminPassword: "change-me"

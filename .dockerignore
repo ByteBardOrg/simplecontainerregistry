@@ -1,0 +1,16 @@
+.git
+.gitignore
+data
+tmp
+dist
+build
+coverage.out
+*.test
+*.log
+*.db
+*.sqlite
+*.sqlite3
+.DS_Store
+.idea
+.vscode
+node_modules
