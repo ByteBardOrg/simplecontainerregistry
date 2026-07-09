@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-conformance:
+    name: Build, Test, OCI Conformance
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run unit tests
+        run: go test ./...
+
+      - name: Build binary
+        run: go build ./cmd/simplecontainerregistry
+
+      - name: Build container image
+        run: docker build -t scr:ci .
+
+      - name: Start registry
+        run: |
+          docker run -d \
+            --name scr-ci \
+            -p 5000:5000 \
+            -e SCR_BOOTSTRAP_ADMIN_USERNAME=admin \
+            -e SCR_BOOTSTRAP_ADMIN_PASSWORD=ci-password \
+            scr:ci
+
+      - name: Wait for registry
+        run: |
+          for attempt in {1..100}; do
+            if curl -fsS http://127.0.0.1:5000/healthz >/dev/null; then
+              exit 0
+            fi
+            if ! docker ps --filter name=scr-ci --filter status=running --quiet | grep -q .; then
+              docker logs scr-ci
+              exit 1
+            fi
+            sleep 0.2
+          done
+          docker logs scr-ci
+          exit 1
+
+      - name: Check out OCI distribution spec
+        uses: actions/checkout@v4
+        with:
+          repository: opencontainers/distribution-spec
+          path: distribution-spec
+
+      - name: Run OCI conformance tests
+        working-directory: distribution-spec/conformance
+        env:
+          OCI_REGISTRY: 127.0.0.1:5000
+          OCI_TLS: disabled
+          OCI_REPO1: conformance/repo1
+          OCI_REPO2: conformance/repo2
+          OCI_USERNAME: admin
+          OCI_PASSWORD: ci-password
+          OCI_VERSION: "1.1"
+          OCI_API_BLOBS_DELETE: "false"
+          OCI_API_BLOBS_MOUNT_ANONYMOUS: "false"
+          OCI_API_BLOBS_UPLOAD_CANCEL: "false"
+          OCI_API_REFERRER: "false"
+        run: go run -buildvcs=true .
+
+      - name: Upload conformance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-conformance-results
+          path: distribution-spec/conformance/results
+          if-no-files-found: ignore
+
+      - name: Show registry logs
+        if: failure()
+        run: docker logs scr-ci
