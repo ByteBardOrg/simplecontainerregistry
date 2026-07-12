@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -557,6 +558,9 @@ func TestUILoginAndDashboard(t *testing.T) {
 	if !strings.Contains(settingsResponse.Body.String(), "Garbage Collection") || !strings.Contains(settingsResponse.Body.String(), "Delete untagged manifests after") {
 		t.Fatalf("expected GC settings form, got %s", settingsResponse.Body.String())
 	}
+	if !strings.Contains(settingsResponse.Body.String(), "Registry Webhook") || !strings.Contains(settingsResponse.Body.String(), "https://example.com/scr-events") {
+		t.Fatalf("expected registry webhook settings form, got %s", settingsResponse.Body.String())
+	}
 	settingsForm := url.Values{}
 	settingsForm.Set("enabled", "on")
 	settingsForm.Set("delay", "30m")
@@ -575,6 +579,26 @@ func TestUILoginAndDashboard(t *testing.T) {
 	}
 	if !gcSettings.Enabled || gcSettings.Delay != 30*time.Minute || gcSettings.Interval != 2*time.Hour {
 		t.Fatalf("unexpected persisted gc settings: %#v", gcSettings)
+	}
+	webhookForm := url.Values{}
+	webhookForm.Set("url", "https://example.com/scr-events")
+	webhookUpdateRequest := httptest.NewRequest(http.MethodPost, "/ui/settings/webhook", strings.NewReader(webhookForm.Encode()))
+	webhookUpdateRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	webhookUpdateRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	webhookUpdateResponse := httptest.NewRecorder()
+	handler.ServeHTTP(webhookUpdateResponse, webhookUpdateRequest)
+	if webhookUpdateResponse.Code != http.StatusFound {
+		t.Fatalf("expected webhook settings update redirect, got %d: %s", webhookUpdateResponse.Code, webhookUpdateResponse.Body.String())
+	}
+	webhookSettings, err := store.RegistryWebhookSettings(ctx)
+	if err != nil {
+		t.Fatalf("RegistryWebhookSettings() error = %v", err)
+	}
+	if webhookSettings.URL != "https://example.com/scr-events" {
+		t.Fatalf("unexpected persisted registry webhook settings: %#v", webhookSettings)
+	}
+	if err := store.UpdateRegistryWebhookSettings(ctx, domain.RegistryWebhookSettings{}, time.Now().UTC()); err != nil {
+		t.Fatalf("UpdateRegistryWebhookSettings(clear) error = %v", err)
 	}
 
 	adminRegistryToken := requestToken(t, handler, "admin", "secret", "repository:ui/app:pull,push,delete")
@@ -830,6 +854,138 @@ func TestUILoginAndDashboard(t *testing.T) {
 	}
 }
 
+func TestRegistryWebhookReceivesRegistryAndUIDeleteEvents(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.Storage.RootDirectory = filepath.Join(t.TempDir(), "registry")
+	cfg.Database.DSN = filepath.Join(t.TempDir(), "test.db")
+	store, err := db.Open(ctx, cfg.Database.DSN)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.InitSchema(ctx); err != nil {
+		t.Fatalf("InitSchema() error = %v", err)
+	}
+	if err := store.EnsureActiveSigningKey(ctx); err != nil {
+		t.Fatalf("EnsureActiveSigningKey() error = %v", err)
+	}
+	if err := auth.BootstrapAdmin(ctx, store, "admin", "secret", time.Now().UTC()); err != nil {
+		t.Fatalf("BootstrapAdmin() error = %v", err)
+	}
+
+	webhookEvents := make(chan registryWebhookPayload, 10)
+	webhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected webhook POST, got %s", r.Method)
+		}
+		if r.Header.Get("Content-Type") != "application/json" {
+			t.Fatalf("expected webhook json content type, got %q", r.Header.Get("Content-Type"))
+		}
+		var payload registryWebhookPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("Decode webhook payload error = %v", err)
+		}
+		webhookEvents <- payload
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(webhookServer.Close)
+	if err := store.UpdateRegistryWebhookSettings(ctx, domain.RegistryWebhookSettings{URL: webhookServer.URL}, time.Now().UTC()); err != nil {
+		t.Fatalf("UpdateRegistryWebhookSettings() error = %v", err)
+	}
+
+	handler := New(Options{Config: cfg, Store: store})
+	token := requestToken(t, handler, "admin", "secret", "repository:webhook/app:pull,push,delete")
+	manifest := []byte(`{"schemaVersion":2}`)
+	putManifest := httptest.NewRecorder()
+	putRequest := httptest.NewRequest(http.MethodPut, "/v2/webhook/app/manifests/latest", bytes.NewReader(manifest))
+	putRequest.Header.Set("Authorization", "Bearer "+token)
+	putRequest.Header.Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+	handler.ServeHTTP(putManifest, putRequest)
+	if putManifest.Code != http.StatusCreated {
+		t.Fatalf("expected manifest push 201, got %d: %s", putManifest.Code, putManifest.Body.String())
+	}
+	pushEvent := waitForWebhookEvent(t, webhookEvents, "registry.manifest.pushed")
+	if pushEvent.Group != "registry.push" || pushEvent.TargetID != "webhook/app" || pushEvent.ID == "" {
+		t.Fatalf("unexpected push webhook payload: %#v", pushEvent)
+	}
+
+	getManifest := authenticatedRequest(handler, http.MethodGet, "/v2/webhook/app/manifests/latest", token, nil)
+	if getManifest.Code != http.StatusOK {
+		t.Fatalf("expected manifest pull 200, got %d: %s", getManifest.Code, getManifest.Body.String())
+	}
+	pullEvent := waitForWebhookEvent(t, webhookEvents, "registry.manifest.pulled")
+	if pullEvent.Group != "registry.pull" || pullEvent.TargetID != "webhook/app" {
+		t.Fatalf("unexpected pull webhook payload: %#v", pullEvent)
+	}
+
+	loginForm := url.Values{}
+	loginForm.Set("username", "admin")
+	loginForm.Set("password", "secret")
+	loginRequest := httptest.NewRequest(http.MethodPost, "/ui/login", strings.NewReader(loginForm.Encode()))
+	loginRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginResponse := httptest.NewRecorder()
+	handler.ServeHTTP(loginResponse, loginRequest)
+	if loginResponse.Code != http.StatusFound || len(loginResponse.Result().Cookies()) == 0 {
+		t.Fatalf("expected UI login redirect with cookie, got %d: %s", loginResponse.Code, loginResponse.Body.String())
+	}
+	deleteForm := url.Values{}
+	deleteForm.Set("repository", "webhook/app")
+	deleteRequest := httptest.NewRequest(http.MethodPost, "/ui/repositories/delete", strings.NewReader(deleteForm.Encode()))
+	deleteRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	deleteRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	deleteResponse := httptest.NewRecorder()
+	handler.ServeHTTP(deleteResponse, deleteRequest)
+	if deleteResponse.Code != http.StatusFound {
+		t.Fatalf("expected UI repository delete redirect, got %d: %s", deleteResponse.Code, deleteResponse.Body.String())
+	}
+	deleteEvent := waitForWebhookEvent(t, webhookEvents, "repository.deleted")
+	if deleteEvent.Group != "registry.delete" || deleteEvent.TargetID != "webhook/app" {
+		t.Fatalf("unexpected repository delete webhook payload: %#v", deleteEvent)
+	}
+}
+
+func TestRegistryWebhookFailureDoesNotFailRegistryRequest(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.Storage.RootDirectory = filepath.Join(t.TempDir(), "registry")
+	cfg.Database.DSN = filepath.Join(t.TempDir(), "test.db")
+	store, err := db.Open(ctx, cfg.Database.DSN)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.InitSchema(ctx); err != nil {
+		t.Fatalf("InitSchema() error = %v", err)
+	}
+	if err := store.EnsureActiveSigningKey(ctx); err != nil {
+		t.Fatalf("EnsureActiveSigningKey() error = %v", err)
+	}
+	createHTTPTestUser(t, ctx, store, "admin", "Admin", domain.RoleAdmin, "secret", time.Now().UTC())
+
+	var attempts atomic.Int32
+	failingWebhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		writeError(w, http.StatusInternalServerError, "webhook down")
+	}))
+	t.Cleanup(failingWebhookServer.Close)
+	if err := store.UpdateRegistryWebhookSettings(ctx, domain.RegistryWebhookSettings{URL: failingWebhookServer.URL}, time.Now().UTC()); err != nil {
+		t.Fatalf("UpdateRegistryWebhookSettings() error = %v", err)
+	}
+
+	handler := New(Options{Config: cfg, Store: store})
+	token := requestToken(t, handler, "admin", "secret", "repository:webhook-failure/app:push")
+	putManifest := httptest.NewRecorder()
+	putRequest := httptest.NewRequest(http.MethodPut, "/v2/webhook-failure/app/manifests/latest", bytes.NewReader([]byte(`{"schemaVersion":2}`)))
+	putRequest.Header.Set("Authorization", "Bearer "+token)
+	putRequest.Header.Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+	handler.ServeHTTP(putManifest, putRequest)
+	if putManifest.Code != http.StatusCreated {
+		t.Fatalf("expected manifest push to ignore webhook failure, got %d: %s", putManifest.Code, putManifest.Body.String())
+	}
+	waitForWebhookAttempt(t, &attempts)
+}
+
 func TestRootRedirectsToRegistryAPI(t *testing.T) {
 	ctx := context.Background()
 	cfg := config.Default()
@@ -938,6 +1094,34 @@ func authenticatedRequest(handler http.Handler, method, path, token string, body
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response
+}
+
+func waitForWebhookEvent(t *testing.T, events <-chan registryWebhookPayload, event string) registryWebhookPayload {
+	t.Helper()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case payload := <-events:
+			if payload.Event == event {
+				return payload
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for webhook event %q", event)
+		}
+	}
+}
+
+func waitForWebhookAttempt(t *testing.T, attempts *atomic.Int32) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if attempts.Load() > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for webhook attempt")
 }
 
 func sha256Digest(content []byte) string {

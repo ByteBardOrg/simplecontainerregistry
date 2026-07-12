@@ -36,6 +36,7 @@ type Server struct {
 	users      auth.UserService
 	tokens     auth.TokenService
 	registryFS storage.Filesystem
+	webhooks   *registryWebhookDispatcher
 	mux        *http.ServeMux
 }
 
@@ -55,6 +56,7 @@ func New(opts Options) http.Handler {
 		users:      auth.NewUserService(opts.Store),
 		tokens:     auth.NewTokenService(opts.Store, opts.Config.Auth),
 		registryFS: registryFS,
+		webhooks:   newRegistryWebhookDispatcher(opts.Store, logger),
 		mux:        http.NewServeMux(),
 	}
 	server.routes()
@@ -82,6 +84,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /ui/audit", s.requireUIAdmin(s.handleUIAudit))
 	s.mux.HandleFunc("GET /ui/settings", s.requireUIAdmin(s.handleUISettings))
 	s.mux.HandleFunc("POST /ui/settings/gc", s.requireUIAdmin(s.handleUIGCSettingsUpdate))
+	s.mux.HandleFunc("POST /ui/settings/webhook", s.requireUIAdmin(s.handleUIRegistryWebhookSettingsUpdate))
 
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux.HandleFunc("GET /token", s.handleToken)

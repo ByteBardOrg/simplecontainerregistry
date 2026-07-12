@@ -148,6 +148,31 @@ func TestStoreGCSettings(t *testing.T) {
 	}
 }
 
+func TestStoreRegistryWebhookSettings(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, ctx)
+
+	settings, err := store.RegistryWebhookSettings(ctx)
+	if err != nil {
+		t.Fatalf("RegistryWebhookSettings(default) error = %v", err)
+	}
+	if settings.URL != "" {
+		t.Fatalf("expected empty default webhook URL, got %#v", settings)
+	}
+
+	updated := domain.RegistryWebhookSettings{URL: "https://example.com/scr-events"}
+	if err := store.UpdateRegistryWebhookSettings(ctx, updated, time.Now().UTC()); err != nil {
+		t.Fatalf("UpdateRegistryWebhookSettings() error = %v", err)
+	}
+	settings, err = store.RegistryWebhookSettings(ctx)
+	if err != nil {
+		t.Fatalf("RegistryWebhookSettings(updated) error = %v", err)
+	}
+	if settings != updated {
+		t.Fatalf("expected updated settings, got %#v", settings)
+	}
+}
+
 func openTestStore(t *testing.T, ctx context.Context) *Store {
 	t.Helper()
 	store, err := Open(ctx, filepath.Join(t.TempDir(), "test.db"))

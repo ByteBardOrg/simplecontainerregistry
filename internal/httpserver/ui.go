@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -131,6 +132,7 @@ type uiPage struct {
 	SearchQuery      string
 	ActionFilter     string
 	GCSettings       domain.GCSettings
+	RegistryWebhook  domain.RegistryWebhookSettings
 	AuditEvents      []auditEventView
 }
 
@@ -680,7 +682,12 @@ func (s *Server) handleUISettings(w http.ResponseWriter, r *http.Request) {
 		s.renderUI(w, "settings", uiPage{Title: "Settings", Active: "settings", Error: "Failed to load settings"})
 		return
 	}
-	s.renderUI(w, "settings", uiPage{Title: "Settings", Active: "settings", GCSettings: settings})
+	webhook, err := s.store.RegistryWebhookSettings(r.Context())
+	if err != nil {
+		s.renderUI(w, "settings", uiPage{Title: "Settings", Active: "settings", GCSettings: settings, Error: "Failed to load webhook settings"})
+		return
+	}
+	s.renderUI(w, "settings", uiPage{Title: "Settings", Active: "settings", GCSettings: settings, RegistryWebhook: webhook})
 }
 
 func (s *Server) handleUIGCSettingsUpdate(w http.ResponseWriter, r *http.Request) {
@@ -710,12 +717,38 @@ func (s *Server) handleUIGCSettingsUpdate(w http.ResponseWriter, r *http.Request
 	http.Redirect(w, r, "/ui/settings", http.StatusFound)
 }
 
+func (s *Server) handleUIRegistryWebhookSettingsUpdate(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		s.renderSettingsWithError(w, r, "Invalid form submission")
+		return
+	}
+	webhookURL := strings.TrimSpace(r.FormValue("url"))
+	if err := validateRegistryWebhookURL(webhookURL); err != nil {
+		s.renderSettingsWithError(w, r, err.Error())
+		return
+	}
+	settings := domain.RegistryWebhookSettings{URL: webhookURL}
+	if err := s.store.UpdateRegistryWebhookSettings(r.Context(), settings, time.Now().UTC()); err != nil {
+		s.renderSettingsWithError(w, r, "Failed to save registry webhook settings")
+		return
+	}
+	if err := s.audit(r, "settings.registry_webhook_updated", "settings", "registry_webhook", "success"); err != nil {
+		s.renderSettingsWithError(w, r, "Failed to write audit event")
+		return
+	}
+	http.Redirect(w, r, "/ui/settings", http.StatusFound)
+}
+
 func (s *Server) renderSettingsWithError(w http.ResponseWriter, r *http.Request, message string) {
 	settings, err := s.store.GCSettings(r.Context(), s.defaultGCSettings())
 	if err != nil {
 		settings = s.defaultGCSettings()
 	}
-	s.renderUI(w, "settings", uiPage{Title: "Settings", Active: "settings", Error: message, GCSettings: settings})
+	webhook, err := s.store.RegistryWebhookSettings(r.Context())
+	if err != nil {
+		webhook = domain.RegistryWebhookSettings{}
+	}
+	s.renderUI(w, "settings", uiPage{Title: "Settings", Active: "settings", Error: message, GCSettings: settings, RegistryWebhook: webhook})
 }
 
 func (s *Server) defaultGCSettings() domain.GCSettings {
@@ -724,6 +757,20 @@ func (s *Server) defaultGCSettings() domain.GCSettings {
 		Delay:    s.cfg.Storage.GCDelay.Std(),
 		Interval: s.cfg.Storage.GCInterval.Std(),
 	}
+}
+
+func validateRegistryWebhookURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	parsed, err := url.ParseRequestURI(raw)
+	if err != nil || parsed.Host == "" {
+		return fmt.Errorf("registry webhook URL must be a valid absolute URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("registry webhook URL must use http or https")
+	}
+	return nil
 }
 
 func auditMatchesAction(view auditEventView, filter string) bool {
@@ -1166,6 +1213,7 @@ const uiTemplateText = `
   {{else if eq .Active "settings"}}
     <div class="page-header"><div><h1 class="page-title">Settings</h1><p class="page-description">Configure registry maintenance behavior.</p></div></div>
     <section class="form-card"><h2 class="form-title">Garbage Collection</h2><form method="post" action="/ui/settings/gc" class="form-grid"><div><label for="gc-enabled">Enabled</label><select id="gc-enabled" name="enabled"><option value="on" {{if .GCSettings.Enabled}}selected{{end}}>Enabled</option><option value="" {{if not .GCSettings.Enabled}}selected{{end}}>Disabled</option></select></div><div><label for="gc-delay">Delete untagged manifests after</label><input id="gc-delay" name="delay" value="{{duration .GCSettings.Delay}}" required></div><div><label for="gc-interval">Run interval</label><input id="gc-interval" name="interval" value="{{duration .GCSettings.Interval}}" required></div><button class="primary-action" type="submit">Save GC Settings</button></form><p class="muted">GC only removes untagged manifest records after the grace period. Blob/layer cleanup is intentionally not enabled yet because blobs can be shared across manifests.</p></section>
+    <section class="form-card"><h2 class="form-title">Registry Webhook</h2><form method="post" action="/ui/settings/webhook" class="form-grid"><div style="grid-column:1 / -2"><label for="registry-webhook-url">Webhook URL</label><input id="registry-webhook-url" name="url" type="url" value="{{.RegistryWebhook.URL}}" placeholder="https://example.com/scr-events"></div><button class="primary-action" type="submit">Save Webhook</button></form><p class="muted">When configured, SCR sends best-effort JSON POST events for registry pull, push, and delete activity, including repository deletes from this UI. Leave the URL empty to disable delivery.</p></section>
   {{end}}
 {{end}}
 

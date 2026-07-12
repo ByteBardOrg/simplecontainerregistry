@@ -141,7 +141,56 @@ Security and storage behavior:
 - Registry blobs and manifests are stored in the configured filesystem root.
 - Repository metadata and dashboard traffic are derived from real push/pull activity.
 - Audit events are recorded for token issuance/denial, admin mutations, and registry push/pull activity.
+- Registry webhook delivery can be configured from the admin Settings UI. When enabled, SCR sends best-effort JSON POST events for registry pull, push, delete, and admin UI repository-delete activity. Webhook failures are logged and do not fail registry requests.
 - Garbage collection removes untagged manifest records after the configured grace period. Blob delete is supported through the OCI API; automated blob/layer garbage collection is intentionally deferred because blobs can be shared across manifests.
+
+## Registry webhooks
+
+Admins can configure a registry webhook URL from `/ui/settings`. Leave the URL empty to disable delivery.
+
+SCR sends registry webhooks as best-effort HTTP `POST` requests with `Content-Type: application/json` and `User-Agent: simplecontainerregistry-webhook`. Webhook delivery is asynchronous, has a short timeout, and does not fail the original registry or admin UI request if the destination is slow, unavailable, or returns a non-2xx response.
+
+Delivered events:
+
+- `registry.manifest.pulled` with group `registry.pull`
+- `registry.blob.pulled` with group `registry.pull`
+- `registry.manifest.pushed` with group `registry.push`
+- `registry.blob.pushed` with group `registry.push`
+- `registry.manifest.deleted` with group `registry.delete`
+- `registry.blob.deleted` with group `registry.delete`
+- `repository.deleted` with group `registry.delete` when an admin deletes a repository from the UI
+
+Webhook payload schema:
+
+```json
+{
+  "id": "aud_...",
+  "event": "registry.manifest.pushed",
+  "group": "registry.push",
+  "targetType": "repository",
+  "targetId": "team/app",
+  "actorUserId": "usr_...",
+  "result": "success",
+  "ipAddress": "203.0.113.10",
+  "userAgent": "docker/27.0.0 go/go1.22 git-commit/... kernel/... os/linux arch/amd64 UpstreamClient(Docker-Client/27.0.0)",
+  "createdAt": "2026-07-11T12:34:56Z"
+}
+```
+
+Payload fields:
+
+- `id`: stable audit event ID for this webhook event.
+- `event`: exact event name.
+- `group`: coarse event group, one of `registry.pull`, `registry.push`, or `registry.delete`.
+- `targetType`: event target type. Registry webhook events currently use `repository`.
+- `targetId`: repository name, such as `team/app`.
+- `actorUserId`: authenticated user ID when available. This field is omitted for anonymous/system events.
+- `result`: audit result. Registry webhook events currently emit successful events only.
+- `ipAddress`: client IP resolved from `X-Forwarded-For`, `X-Real-IP`, or the remote address.
+- `userAgent`: request user agent.
+- `createdAt`: event creation timestamp in RFC 3339 format.
+
+OCI clients can make multiple registry API calls for one high-level image operation. For example, a single `docker pull` usually emits one manifest pull event plus one or more blob pull events.
 
 ## API surface
 
@@ -203,6 +252,7 @@ Admin UI:
 - `GET /ui/audit`
 - `GET /ui/settings`
 - `POST /ui/settings/gc`
+- `POST /ui/settings/webhook`
 
 `GET /` redirects to `/v2/` so container clients see the registry API root by default.
 
@@ -222,7 +272,8 @@ Implemented:
 - Repository UI accordion view with tag metadata, newest-pushed-first ordering, and client-side tag table sorting
 - Customer access UI for repository-prefix grants, including wildcard `*`, pull, push, and delete actions
 - Audit UI filtering by query and action class
-- Settings UI for garbage collection enablement, grace period, and run interval
+- Settings UI for garbage collection enablement, grace period, run interval, and registry webhook URL
+- Registry webhook delivery for pull, push, delete, and admin UI repository-delete activity
 - User creation, disable/enable, deletion, and grant deletion
 - Repository read model and dashboard summary counters
 - Server-rendered admin UI for dashboard, repositories, users, and audit log

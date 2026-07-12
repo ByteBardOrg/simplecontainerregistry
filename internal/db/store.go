@@ -48,9 +48,10 @@ type UpsertRepositoryTagParams struct {
 }
 
 const (
-	settingGCEnabled  = "gc.enabled"
-	settingGCDelay    = "gc.delay"
-	settingGCInterval = "gc.interval"
+	settingGCEnabled          = "gc.enabled"
+	settingGCDelay            = "gc.delay"
+	settingGCInterval         = "gc.interval"
+	settingRegistryWebhookURL = "webhook.registry_url"
 )
 
 func Open(ctx context.Context, dsn string) (*Store, error) {
@@ -586,6 +587,27 @@ func (s *Store) UpdateGCSettings(ctx context.Context, settings domain.GCSettings
 		}
 	}
 	return tx.Commit()
+}
+
+func (s *Store) RegistryWebhookSettings(ctx context.Context) (domain.RegistryWebhookSettings, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT value FROM app_settings WHERE key = ?`, settingRegistryWebhookURL)
+	var settings domain.RegistryWebhookSettings
+	if err := row.Scan(&settings.URL); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.RegistryWebhookSettings{}, nil
+		}
+		return domain.RegistryWebhookSettings{}, err
+	}
+	return settings, nil
+}
+
+func (s *Store) UpdateRegistryWebhookSettings(ctx context.Context, settings domain.RegistryWebhookSettings, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+		settingRegistryWebhookURL, settings.URL, now,
+	)
+	return err
 }
 
 func dayStart(value time.Time) time.Time {

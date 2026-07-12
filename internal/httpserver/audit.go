@@ -9,6 +9,7 @@ import (
 
 	"simplecontainerregistry/internal/auth"
 	"simplecontainerregistry/internal/domain"
+	"simplecontainerregistry/internal/ids"
 )
 
 type principalContextKey struct{}
@@ -28,7 +29,7 @@ func (s *Server) audit(r *http.Request, action, targetType, targetID, result str
 	if ok {
 		actorUserID = stringPtr(principal.UserID)
 	}
-	return s.store.InsertAuditEvent(r.Context(), domain.AuditEvent{
+	return s.insertAuditEvent(r.Context(), domain.AuditEvent{
 		ActorUserID: actorUserID,
 		Action:      action,
 		TargetType:  targetType,
@@ -42,7 +43,7 @@ func (s *Server) audit(r *http.Request, action, targetType, targetID, result str
 
 func (s *Server) auditWithActor(r *http.Request, principal auth.Principal, action, targetType, targetID, result string) error {
 	actorUserID := stringPtr(principal.UserID)
-	return s.store.InsertAuditEvent(r.Context(), domain.AuditEvent{
+	return s.insertAuditEvent(r.Context(), domain.AuditEvent{
 		ActorUserID: actorUserID,
 		Action:      action,
 		TargetType:  targetType,
@@ -55,7 +56,7 @@ func (s *Server) auditWithActor(r *http.Request, principal auth.Principal, actio
 }
 
 func (s *Server) auditAnonymous(r *http.Request, action, targetType, targetID, result string) error {
-	return s.store.InsertAuditEvent(r.Context(), domain.AuditEvent{
+	return s.insertAuditEvent(r.Context(), domain.AuditEvent{
 		Action:     action,
 		TargetType: targetType,
 		TargetID:   targetID,
@@ -64,6 +65,23 @@ func (s *Server) auditAnonymous(r *http.Request, action, targetType, targetID, r
 		UserAgent:  r.UserAgent(),
 		CreatedAt:  time.Now().UTC(),
 	})
+}
+
+func (s *Server) insertAuditEvent(ctx context.Context, event domain.AuditEvent) error {
+	if event.ID == "" {
+		id, err := ids.New("aud")
+		if err != nil {
+			return err
+		}
+		event.ID = id
+	}
+	if err := s.store.InsertAuditEvent(ctx, event); err != nil {
+		return err
+	}
+	if s.webhooks != nil {
+		s.webhooks.Enqueue(event)
+	}
+	return nil
 }
 
 func requestIP(r *http.Request) string {

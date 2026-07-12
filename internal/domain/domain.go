@@ -91,6 +91,10 @@ type GCSettings struct {
 	Interval time.Duration
 }
 
+type RegistryWebhookSettings struct {
+	URL string
+}
+
 type AuditEvent struct {
 	ID          string    `json:"id"`
 	ActorUserID *string   `json:"actorUserId,omitempty"`
