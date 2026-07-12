@@ -7,6 +7,7 @@ Current development status: `pre-release`
 This repository contains the Go implementation for a self-hosted OCI container registry with managed user access, SQLite-backed management data, filesystem-backed registry storage, audit logging, and a server-rendered admin UI.
 
 Registry content is stored on disk. Users, repository grants, repository metadata, usage counters, audit events, and signing keys are stored in SQLite.
+<img width="1162" height="705" alt="image" src="https://github.com/user-attachments/assets/dfb9409b-4d0b-47d2-ad50-5890f511d3a5" />
 
 ## Getting started
 
