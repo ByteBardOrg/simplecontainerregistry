@@ -512,7 +512,11 @@ func (fs Filesystem) manifestDigestPath(repoPath, digest string) (string, error)
 }
 
 func (fs Filesystem) linkManifestTag(repoPath, tag, digest string) error {
-	tagPath := fs.safeJoin("repositories", repoPath, "tags", sanitizeReference(tag))
+	safeTag, err := sanitizeReference(tag)
+	if err != nil {
+		return err
+	}
+	tagPath := fs.safeJoin("repositories", repoPath, "tags", safeTag)
 	if err := os.MkdirAll(filepath.Dir(tagPath), 0o750); err != nil {
 		return err
 	}
@@ -668,8 +672,22 @@ func safeRepositoryPath(repository string) (string, error) {
 	return repository, nil
 }
 
-func sanitizeReference(reference string) string {
-	reference = strings.ReplaceAll(reference, "/", "_")
-	reference = strings.ReplaceAll(reference, ":", "_")
-	return reference
+func sanitizeReference(reference string) (string, error) {
+	reference = strings.TrimSpace(reference)
+	if reference == "" {
+		return "", fmt.Errorf("invalid reference")
+	}
+	if strings.Contains(reference, "/") || strings.Contains(reference, "\\") || strings.Contains(reference, "..") {
+		return "", fmt.Errorf("invalid reference")
+	}
+	for _, r := range reference {
+		if (r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			r == '.' || r == '-' || r == '_' {
+			continue
+		}
+		return "", fmt.Errorf("invalid reference")
+	}
+	return reference, nil
 }
