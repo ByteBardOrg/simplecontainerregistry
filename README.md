@@ -345,6 +345,17 @@ scripts/oci-smoke.sh
 
 The smoke test starts the server, creates an admin and pull-only reader, pushes an OCI manifest/blob, lists tags, pulls as reader, verifies reader push/admin access is denied, checks catalog/repository/dashboard/audit APIs, and deletes the pushed manifest.
 
+Seed and verify a running SCR instance without deleting the created data:
+
+```bash
+BASE_URL=http://127.0.0.1:5000 \
+ADMIN_USERNAME=admin \
+ADMIN_PASSWORD=change-me \
+scripts/functional-demo.sh
+```
+
+The functional demo script pushes an OCI repository, creates one expiring read-only user for that repository, creates a second expiring read-only user for a different repository, verifies the first user can pull, verifies the second user cannot access the seeded repository, verifies push/admin access is denied, and leaves the repository and users in place for admin UI testing.
+
 Useful smoke test overrides:
 
 - `PORT=18081`
