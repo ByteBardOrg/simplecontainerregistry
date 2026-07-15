@@ -6,6 +6,7 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -127,6 +128,8 @@ type uiPage struct {
 	Summary          domain.DashboardSummary
 	Traffic          []trafficDayView
 	TrafficTotal     int
+	TrafficRepos     []trafficRepositoryGroupView
+	SelectedTraffic  string
 	Users            []userAccessView
 	Repos            []repositoryView
 	SearchQuery      string
@@ -171,6 +174,16 @@ type trafficDayView struct {
 	Pushes     int
 	PullHeight int
 	PushHeight int
+}
+
+type trafficRepositoryGroupView struct {
+	Label        string
+	Repositories []trafficRepositoryOptionView
+}
+
+type trafficRepositoryOptionView struct {
+	Name  string
+	Label string
 }
 
 func (s *Server) handleUIRoot(w http.ResponseWriter, r *http.Request) {
@@ -245,13 +258,56 @@ func (s *Server) handleUIDashboard(w http.ResponseWriter, r *http.Request) {
 		s.renderUI(w, "dashboard", uiPage{Title: "Dashboard", Active: "dashboard", Error: "Failed to load dashboard"})
 		return
 	}
-	usage, err := s.store.DailyUsage(r.Context(), now, 7)
+	repositories, err := s.store.ListRepositories(r.Context())
 	if err != nil {
-		s.renderUI(w, "dashboard", uiPage{Title: "Dashboard", Active: "dashboard", Summary: summary, Error: "Failed to load traffic counters"})
+		s.renderUI(w, "dashboard", uiPage{Title: "Dashboard", Active: "dashboard", Summary: summary, Error: "Failed to load repositories"})
+		return
+	}
+	selectedTraffic := selectedTrafficRepository(repositories, r.URL.Query().Get("repository"))
+	usage, err := s.store.DailyUsage(r.Context(), now, 7, selectedTraffic)
+	if err != nil {
+		s.renderUI(w, "dashboard", uiPage{Title: "Dashboard", Active: "dashboard", Summary: summary, TrafficRepos: buildTrafficRepositoryGroups(repositories), SelectedTraffic: selectedTraffic, Error: "Failed to load traffic counters"})
 		return
 	}
 	traffic, total := buildTrafficView(usage)
-	s.renderUI(w, "dashboard", uiPage{Title: "Dashboard", Active: "dashboard", Summary: summary, Traffic: traffic, TrafficTotal: total})
+	s.renderUI(w, "dashboard", uiPage{Title: "Dashboard", Active: "dashboard", Summary: summary, Traffic: traffic, TrafficTotal: total, TrafficRepos: buildTrafficRepositoryGroups(repositories), SelectedTraffic: selectedTraffic})
+}
+
+func selectedTrafficRepository(repositories []domain.Repository, requested string) string {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		return ""
+	}
+	for _, repository := range repositories {
+		if repository.Name == requested {
+			return requested
+		}
+	}
+	return ""
+}
+
+func buildTrafficRepositoryGroups(repositories []domain.Repository) []trafficRepositoryGroupView {
+	byPrefix := make(map[string][]trafficRepositoryOptionView)
+	for _, repository := range repositories {
+		prefix, name := splitRepositoryName(repository.Name)
+		byPrefix[prefix] = append(byPrefix[prefix], trafficRepositoryOptionView{Name: repository.Name, Label: name})
+	}
+
+	prefixes := make([]string, 0, len(byPrefix))
+	for prefix := range byPrefix {
+		prefixes = append(prefixes, prefix)
+	}
+	sort.Strings(prefixes)
+
+	groups := make([]trafficRepositoryGroupView, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		label := prefix
+		if label == "" {
+			label = "No prefix"
+		}
+		groups = append(groups, trafficRepositoryGroupView{Label: label, Repositories: byPrefix[prefix]})
+	}
+	return groups
 }
 
 func buildTrafficView(usage []domain.DailyUsage) ([]trafficDayView, int) {
@@ -905,6 +961,8 @@ const uiTemplateText = `
     .panel-head { padding:16px; border-bottom:1px solid rgba(197,197,211,.65); border-radius:12px 12px 0 0; background:var(--surface-low); display:flex; align-items:center; justify-content:space-between; gap:12px; }
     .panel-title { margin:0; font:500 14px/20px Geist, sans-serif; }
     .panel-body { padding:16px; }
+    .traffic-filter { min-width:220px; }
+    .traffic-filter select { max-width:280px; }
     .traffic-bars { height:260px; display:flex; align-items:end; gap:8px; padding-top:24px; }
     .traffic-day { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:end; gap:4px; height:100%; color:var(--muted); font:600 12px/16px Geist, sans-serif; }
     .bar { width:100%; border-radius:4px 4px 0 0; background:var(--primary); min-height:8px; }
@@ -1179,7 +1237,7 @@ const uiTemplateText = `
       <div class="stat-card"><div class="stat-head"><span>Pulls (24h)</span><span class="material-symbols-outlined">download</span></div><div class="stat-value">{{.Summary.Pulls24h}}</div></div>
       <div class="stat-card"><div class="stat-head"><span>Pushes (24h)</span><span class="material-symbols-outlined">upload</span></div><div class="stat-value">{{.Summary.Pushes24h}}</div></div>
     </section>
-    <section class="bento"><div class="panel"><div class="panel-head"><h2 class="panel-title">Network Traffic (7 Days)</h2><span class="muted">Pull and push counters</span></div><div class="panel-body">{{if gt .TrafficTotal 0}}<div class="traffic-bars">{{range .Traffic}}<div class="traffic-day" title="{{.Label}}: {{.Pulls}} pulls, {{.Pushes}} pushes"><div class="bar {{if eq .Pulls 0}}zero{{end}}" style="height:{{.PullHeight}}%"></div><div class="bar push {{if eq .Pushes 0}}zero{{end}}" style="height:{{.PushHeight}}%"></div><span>{{.Label}}</span></div>{{end}}</div>{{else}}<div class="empty-state"><div><strong>No registry traffic yet</strong><br><span>Push or pull an image to populate this chart.</span></div></div>{{end}}</div></div><div class="panel"><div class="panel-head"><h2 class="panel-title">Access Health</h2></div><div class="panel-body activity-list"><div class="activity-item"><div class="activity-icon"><span class="material-symbols-outlined">vpn_key</span></div><div><strong>{{.Summary.UsersExpiringSoon}}</strong> users expiring soon<p class="muted">Next 14 days</p></div></div><div class="activity-item"><div class="activity-icon"><span class="material-symbols-outlined">dns</span></div><div><strong>{{.Summary.Repositories}}</strong> repositories tracked<p class="muted">Read model from registry writes</p></div></div></div></div></section>
+    <section class="bento"><div class="panel"><div class="panel-head"><div><h2 class="panel-title">Network Traffic (7 Days)</h2><span class="muted">{{if .SelectedTraffic}}Repository: {{.SelectedTraffic}}{{else}}Pull and push counters{{end}}</span></div><form class="traffic-filter" method="get" action="/ui"><select name="repository" aria-label="Traffic repository" onchange="this.form.submit()"><option value="" {{if eq .SelectedTraffic ""}}selected{{end}}>All repositories</option>{{range .TrafficRepos}}<optgroup label="{{.Label}}">{{range .Repositories}}<option value="{{.Name}}" {{if eq .Name $.SelectedTraffic}}selected{{end}}>{{.Label}}</option>{{end}}</optgroup>{{end}}</select><noscript><button class="small-action" type="submit">Apply</button></noscript></form></div><div class="panel-body">{{if gt .TrafficTotal 0}}<div class="traffic-bars">{{range .Traffic}}<div class="traffic-day" title="{{.Label}}: {{.Pulls}} pulls, {{.Pushes}} pushes"><div class="bar {{if eq .Pulls 0}}zero{{end}}" style="height:{{.PullHeight}}%"></div><div class="bar push {{if eq .Pushes 0}}zero{{end}}" style="height:{{.PushHeight}}%"></div><span>{{.Label}}</span></div>{{end}}</div>{{else}}<div class="empty-state"><div><strong>{{if .SelectedTraffic}}No traffic for this repository{{else}}No registry traffic yet{{end}}</strong><br><span>Push or pull an image to populate this chart.</span></div></div>{{end}}</div></div><div class="panel"><div class="panel-head"><h2 class="panel-title">Access Health</h2></div><div class="panel-body activity-list"><div class="activity-item"><div class="activity-icon"><span class="material-symbols-outlined">vpn_key</span></div><div><strong>{{.Summary.UsersExpiringSoon}}</strong> users expiring soon<p class="muted">Next 14 days</p></div></div><div class="activity-item"><div class="activity-icon"><span class="material-symbols-outlined">dns</span></div><div><strong>{{.Summary.Repositories}}</strong> repositories tracked<p class="muted">Read model from registry writes</p></div></div></div></div></section>
   {{else if eq .Active "repositories"}}
     <div class="page-header"><div><h1 class="page-title">Image Repositories</h1><p class="page-description">Browse pushed images, inspect tags, and remove stale image references.</p></div></div>
     <form class="filters" method="get" action="/ui/repositories"><div class="search"><span class="material-symbols-outlined">search</span><input name="q" value="{{.SearchQuery}}" placeholder="Search repositories, namespaces, tags, or digests" aria-label="Search repositories"></div><button class="small-action" type="submit">Search</button>{{if .SearchQuery}}<a class="secondary-action" href="/ui/repositories">Clear</a>{{end}}</form>

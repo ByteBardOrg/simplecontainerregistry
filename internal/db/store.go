@@ -483,7 +483,7 @@ func (s *Store) DashboardSummary(ctx context.Context, now time.Time) (domain.Das
 	return summary, nil
 }
 
-func (s *Store) DailyUsage(ctx context.Context, now time.Time, days int) ([]domain.DailyUsage, error) {
+func (s *Store) DailyUsage(ctx context.Context, now time.Time, days int, repositoryName string) ([]domain.DailyUsage, error) {
 	if days <= 0 || days > 31 {
 		days = 7
 	}
@@ -498,10 +498,16 @@ func (s *Store) DailyUsage(ctx context.Context, now time.Time, days int) ([]doma
 		byDay[date.Format("2006-01-02")] = i
 	}
 
-	rows, err := s.db.QueryContext(ctx, `
+	query := `
 		SELECT action, count, window_start
 		FROM usage_counters
-		WHERE window_start >= ? AND window_start < ?`, start, end)
+		WHERE window_start >= ? AND window_start < ?`
+	args := []any{start, end}
+	if repositoryName != "" {
+		query += ` AND repository_name = ?`
+		args = append(args, repositoryName)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -105,7 +105,10 @@ func TestStoreRepositoryReadModelFlow(t *testing.T) {
 	if err := store.IncrementUsageCounter(ctx, "team-a/app", domain.ActionPush, now.Add(25*time.Hour)); err != nil {
 		t.Fatalf("IncrementUsageCounter(push) error = %v", err)
 	}
-	series, err := store.DailyUsage(ctx, now.Add(26*time.Hour), 7)
+	if err := store.IncrementUsageCounter(ctx, "team-b/api", domain.ActionPull, now.Add(25*time.Hour)); err != nil {
+		t.Fatalf("IncrementUsageCounter(other repo pull) error = %v", err)
+	}
+	series, err := store.DailyUsage(ctx, now.Add(26*time.Hour), 7, "")
 	if err != nil {
 		t.Fatalf("DailyUsage() error = %v", err)
 	}
@@ -117,8 +120,21 @@ func TestStoreRepositoryReadModelFlow(t *testing.T) {
 		pulls += day.Pulls
 		pushes += day.Pushes
 	}
+	if pulls != 2 || pushes != 1 {
+		t.Fatalf("expected aggregate usage in series, got pulls=%d pushes=%d series=%#v", pulls, pushes, series)
+	}
+
+	series, err = store.DailyUsage(ctx, now.Add(26*time.Hour), 7, "team-a/app")
+	if err != nil {
+		t.Fatalf("DailyUsage(team-a/app) error = %v", err)
+	}
+	pulls, pushes = 0, 0
+	for _, day := range series {
+		pulls += day.Pulls
+		pushes += day.Pushes
+	}
 	if pulls != 1 || pushes != 1 {
-		t.Fatalf("expected one pull and one push in series, got pulls=%d pushes=%d series=%#v", pulls, pushes, series)
+		t.Fatalf("expected filtered team-a/app usage in series, got pulls=%d pushes=%d series=%#v", pulls, pushes, series)
 	}
 }
 

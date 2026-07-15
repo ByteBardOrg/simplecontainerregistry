@@ -613,6 +613,19 @@ func TestUILoginAndDashboard(t *testing.T) {
 			t.Fatalf("expected UI fixture manifest push 201, got %d: %s", putManifest.Code, putManifest.Body.String())
 		}
 	}
+	trafficRequest := httptest.NewRequest(http.MethodGet, "/ui?repository="+url.QueryEscape("ui/app"), nil)
+	trafficRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	trafficResponse := httptest.NewRecorder()
+	handler.ServeHTTP(trafficResponse, trafficRequest)
+	if trafficResponse.Code != http.StatusOK {
+		t.Fatalf("expected filtered dashboard 200, got %d: %s", trafficResponse.Code, trafficResponse.Body.String())
+	}
+	if !strings.Contains(trafficResponse.Body.String(), `<optgroup label="ui">`) || !strings.Contains(trafficResponse.Body.String(), `<option value="ui/app" selected>app</option>`) {
+		t.Fatalf("expected traffic repository dropdown grouped by prefix, got %s", trafficResponse.Body.String())
+	}
+	if !strings.Contains(trafficResponse.Body.String(), "Repository: ui/app") || !strings.Contains(trafficResponse.Body.String(), "2 pushes") {
+		t.Fatalf("expected filtered dashboard traffic for ui/app, got %s", trafficResponse.Body.String())
+	}
 	repositoriesRequest := httptest.NewRequest(http.MethodGet, "/ui/repositories", nil)
 	repositoriesRequest.AddCookie(loginResponse.Result().Cookies()[0])
 	repositoriesResponse := httptest.NewRecorder()
