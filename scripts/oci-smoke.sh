@@ -166,7 +166,6 @@ http:
 
 storage:
   rootDirectory: "$WORKDIR/registry"
-  commit: true
   gc: true
   gcDelay: "1h"
   gcInterval: "24h"

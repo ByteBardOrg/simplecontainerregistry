@@ -55,7 +55,6 @@ http:
 
 storage:
   rootDirectory: "/var/lib/scr/registry"
-  commit: true
   gc: true
   gcDelay: "1h"
   gcInterval: "24h"
@@ -86,11 +85,10 @@ Configuration supports these sections:
 
 - `http.address` and `http.port`
 - `storage.rootDirectory`
-- `storage.commit`
 - `storage.gc`
 - `storage.gcDelay`
 - `storage.gcInterval`
-- `database.driver` set to `sqlite`
+- `database.driver` set to `sqlite`; other database drivers are not supported
 - `database.dsn`
 - `auth.issuer`
 - `auth.service`

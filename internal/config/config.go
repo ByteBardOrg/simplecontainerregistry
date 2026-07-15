@@ -26,7 +26,6 @@ type HTTPConfig struct {
 
 type StorageConfig struct {
 	RootDirectory string   `yaml:"rootDirectory"`
-	Commit        bool     `yaml:"commit"`
 	GC            bool     `yaml:"gc"`
 	GCDelay       Duration `yaml:"gcDelay"`
 	GCInterval    Duration `yaml:"gcInterval"`
@@ -88,7 +87,6 @@ func Default() Config {
 		},
 		Storage: StorageConfig{
 			RootDirectory: "/var/lib/scr/registry",
-			Commit:        true,
 			GC:            true,
 			GCDelay:       Duration(time.Hour),
 			GCInterval:    Duration(24 * time.Hour),
