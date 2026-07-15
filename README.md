@@ -135,8 +135,9 @@ Access model:
 
 - Each user is the login identity and access secret.
 - User creation returns the secret once.
-- Reader users need repository-prefix grants for pull/push access.
-- Repository grants can target `*` for all repositories, a namespace prefix such as `shieldedstack/`, or an exact image repository such as `shieldedstack/proxy`.
+- Reader users need repository-prefix grants for pull, push, or delete access.
+- Repository grants can target `*` for all repositories or a simple repository string prefix such as `shieldedstack/`.
+- Grant prefixes are string-prefix matches, not glob or regex patterns. For example, `team/` matches repositories under that namespace, while `team/app` also matches names beginning with `team/app`.
 - Admin users can request repository access without grants.
 - Users may have an optional valid-from date and optional expiry date.
 - Token validation re-checks current user status and validity, so disabled, future-valid, and expired users are rejected even if a token was issued earlier.
@@ -149,7 +150,7 @@ Security and storage behavior:
 - JWT signing keys are persisted in SQLite.
 - Registry blobs and manifests are stored in the configured filesystem root.
 - Repository metadata and dashboard traffic are derived from real push/pull activity.
-- Audit events are recorded for token issuance/denial, admin mutations, and registry push/pull activity.
+- Audit events are recorded for token issuance/denial, admin mutations, registry push/pull/delete activity, and authenticated registry access denials.
 - Registry webhook delivery can be configured from the admin Settings UI. When enabled, SCR sends best-effort JSON POST events for registry pull, push, delete, and admin UI repository-delete activity. Webhook failures are logged and do not fail registry requests.
 - Garbage collection removes untagged manifest records after the configured grace period. Blob delete is supported through the OCI API; automated blob/layer garbage collection is intentionally deferred because blobs can be shared across manifests.
 
@@ -200,6 +201,8 @@ Payload fields:
 - `createdAt`: event creation timestamp in RFC 3339 format.
 
 OCI clients can make multiple registry API calls for one high-level image operation. For example, a single `docker pull` usually emits one manifest pull event plus one or more blob pull events.
+
+Registry access denials are stored in audit events as `registry.access.denied` with result `denied`. They are not delivered to registry webhooks.
 
 ## API surface
 
@@ -354,7 +357,7 @@ ADMIN_PASSWORD=change-me \
 scripts/functional-demo.sh
 ```
 
-The functional demo script pushes an OCI repository, creates one expiring read-only user for that repository, creates a second expiring read-only user for a different repository, verifies the first user can pull, verifies the second user cannot access the seeded repository, verifies push/admin access is denied, and leaves the repository and users in place for admin UI testing.
+The functional demo script pushes an OCI repository, creates one expiring read-only user for that repository, creates a second expiring read-only user for a different repository, verifies the first user can pull, verifies the second user cannot access the seeded repository, verifies push/admin access is denied, verifies the denied registry access appears in audit events, and leaves the repository and users in place for admin UI testing.
 
 Useful smoke test overrides:
 
