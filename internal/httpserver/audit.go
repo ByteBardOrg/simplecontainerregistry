@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -82,6 +83,35 @@ func (s *Server) insertAuditEvent(ctx context.Context, event domain.AuditEvent) 
 		s.webhooks.Enqueue(event)
 	}
 	return nil
+}
+
+func (s *Server) auditGrantTarget(ctx context.Context, grant domain.Grant) string {
+	subject := grant.SubjectID
+	if user, err := s.store.GetUser(ctx, grant.SubjectID); err == nil {
+		subject = user.Username
+	}
+	return fmt.Sprintf("%s | %s | %s", subject, grant.RepositoryPrefix, auditActionsLabel(grant.Actions))
+}
+
+func (s *Server) auditGrantTargetByID(ctx context.Context, grantID string) string {
+	grants, err := s.store.ListGrants(ctx)
+	if err != nil {
+		return grantID
+	}
+	for _, grant := range grants {
+		if grant.ID == grantID {
+			return s.auditGrantTarget(ctx, grant)
+		}
+	}
+	return grantID
+}
+
+func auditActionsLabel(actions []domain.Action) string {
+	parts := make([]string, 0, len(actions))
+	for _, action := range actions {
+		parts = append(parts, string(action))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func requestIP(r *http.Request) string {

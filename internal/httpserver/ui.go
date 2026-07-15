@@ -112,12 +112,7 @@ var uiTemplates = template.Must(template.New("ui").Funcs(template.FuncMap{
 			return "settings"
 		}
 	},
-	"resultClass": func(result string) string {
-		if result == "success" {
-			return "badge success"
-		}
-		return "badge error"
-	},
+	"resultClass": auditResultClass,
 }).Parse(uiTemplateText))
 
 type uiPage struct {
@@ -526,7 +521,7 @@ func (s *Server) handleUIUsersCreate(w http.ResponseWriter, r *http.Request) {
 		s.renderUsersWithError(w, r, err.Error())
 		return
 	}
-	if err := s.audit(r, "grant.created", "grant", grant.ID, "success"); err != nil {
+	if err := s.audit(r, "grant.created", "grant", s.auditGrantTarget(r.Context(), grant), "success"); err != nil {
 		s.renderUsersWithError(w, r, "Failed to write audit event")
 		return
 	}
@@ -596,7 +591,7 @@ func (s *Server) handleUIUserAccessUpdate(w http.ResponseWriter, r *http.Request
 		s.renderUsersWithError(w, r, err.Error())
 		return
 	}
-	if err := s.audit(r, "grant.updated", "grant", grant.ID, "success"); err != nil {
+	if err := s.audit(r, "grant.updated", "grant", s.auditGrantTarget(r.Context(), grant), "success"); err != nil {
 		s.renderUsersWithError(w, r, "Failed to write audit event")
 		return
 	}
@@ -870,6 +865,16 @@ func auditMatchesQuery(view auditEventView, query string) bool {
 	return false
 }
 
+func auditResultClass(result string) string {
+	if result == "denied" {
+		return "badge denied"
+	}
+	if result == "success" {
+		return "badge success"
+	}
+	return "badge error"
+}
+
 func (s *Server) auditActorLabel(r *http.Request, event domain.AuditEvent) string {
 	if event.ActorUserID == nil || *event.ActorUserID == "" {
 		return "system"
@@ -887,6 +892,10 @@ func (s *Server) auditTargetLabel(r *http.Request, event domain.AuditEvent) stri
 		user, err := s.store.GetUser(r.Context(), event.TargetID)
 		if err == nil {
 			return user.Username
+		}
+	case "grant":
+		if strings.HasPrefix(event.TargetID, "grnt_") {
+			return s.auditGrantTargetByID(r.Context(), event.TargetID)
 		}
 	}
 	if event.TargetID == "" {
@@ -1025,7 +1034,7 @@ const uiTemplateText = `
     .badge.reader { background:var(--surface-container); color:var(--muted); }
     .badge.active, .badge.success { background:var(--success-bg); color:var(--success); }
     .badge.disabled, .badge.expired, .badge.error { background:var(--error-bg); color:var(--error); }
-    .badge.pending { background:var(--warning-bg); color:var(--warning); }
+    .badge.pending, .badge.denied { background:var(--warning-bg); color:var(--warning); }
     .badge::before { content:""; width:6px; height:6px; border-radius:999px; background:currentColor; }
     .form-card { margin-bottom:16px; padding:16px; background:var(--surface); border:1px solid var(--line); border-radius:12px; box-shadow:0 4px 12px rgba(0,0,0,.02); }
     .form-title { margin:0 0 12px; font:500 16px/24px Geist, sans-serif; }
@@ -1269,7 +1278,7 @@ const uiTemplateText = `
   {{else if eq .Active "audit"}}
     <div class="page-header"><div><h1 class="page-title">Audit Log</h1><p class="page-description">Review system activities, access events, and administrative actions.</p></div></div>
     <form class="filters" method="get" action="/ui/audit"><div class="search"><span class="material-symbols-outlined">filter_list</span><input name="q" value="{{.SearchQuery}}" placeholder="Filter by action, user, target, result, IP, or user agent" aria-label="Filter audit log"></div><select name="action" aria-label="Action filter"><option value="all" {{if or (eq .ActionFilter "") (eq .ActionFilter "all")}}selected{{end}}>All Actions</option><option value="authentication" {{if eq .ActionFilter "authentication"}}selected{{end}}>Authentication</option><option value="pull" {{if eq .ActionFilter "pull"}}selected{{end}}>Image Pull</option><option value="push" {{if eq .ActionFilter "push"}}selected{{end}}>Image Push</option><option value="admin" {{if eq .ActionFilter "admin"}}selected{{end}}>Admin Changes</option></select><button class="small-action" type="submit">Apply</button>{{if or .SearchQuery .ActionFilter}}<a class="secondary-action" href="/ui/audit">Clear</a>{{end}}</form>
-    <div class="table-card"><div class="table-scroll"><table><thead><tr><th>Time (UTC)</th><th>Action</th><th>Target / Resource</th><th>Actor / IP Address</th><th>Result</th></tr></thead><tbody>{{range .AuditEvents}}<tr><td class="muted">{{timeValue .Event.CreatedAt}}</td><td><div class="user-cell" style="color:var(--primary)"><span class="material-symbols-outlined">{{actionIcon .Event.Action}}</span><strong>{{.Event.Action}}</strong></div></td><td class="mono">{{.Event.TargetType}} / {{.Target}}</td><td><div><strong>{{.Actor}}</strong><div class="muted">{{.Event.IPAddress}}</div></div></td><td><span class="{{resultClass .Event.Result}}">{{.Event.Result}}</span></td></tr>{{else}}<tr><td colspan="5" class="muted">{{if or .SearchQuery .ActionFilter}}No audit events match this filter.{{else}}No audit events yet.{{end}}</td></tr>{{end}}</tbody></table></div></div>
+    <div class="table-card"><div class="table-scroll"><table><thead><tr><th>Time (UTC)</th><th>Action</th><th>Target / Resource</th><th>Actor / IP Address</th><th>Result</th></tr></thead><tbody>{{range .AuditEvents}}<tr><td class="muted">{{timeValue .Event.CreatedAt}}</td><td><div class="user-cell" style="color:var(--primary)"><span class="material-symbols-outlined">{{actionIcon .Event.Action}}</span><strong>{{.Event.Action}}</strong></div></td><td class="mono">{{.Event.TargetType}} | {{.Target}}</td><td><div><strong>{{.Actor}}</strong><div class="muted">{{.Event.IPAddress}}</div></div></td><td><span class="{{resultClass .Event.Result}}">{{.Event.Result}}</span></td></tr>{{else}}<tr><td colspan="5" class="muted">{{if or .SearchQuery .ActionFilter}}No audit events match this filter.{{else}}No audit events yet.{{end}}</td></tr>{{end}}</tbody></table></div></div>
   {{else if eq .Active "settings"}}
     <div class="page-header"><div><h1 class="page-title">Settings</h1><p class="page-description">Configure registry maintenance behavior.</p></div></div>
     <section class="form-card"><h2 class="form-title">Garbage Collection</h2><form method="post" action="/ui/settings/gc" class="form-grid"><div><label for="gc-enabled">Enabled</label><select id="gc-enabled" name="enabled"><option value="on" {{if .GCSettings.Enabled}}selected{{end}}>Enabled</option><option value="" {{if not .GCSettings.Enabled}}selected{{end}}>Disabled</option></select></div><div><label for="gc-delay">Delete untagged manifests after</label><input id="gc-delay" name="delay" value="{{duration .GCSettings.Delay}}" required></div><div><label for="gc-interval">Run interval</label><input id="gc-interval" name="interval" value="{{duration .GCSettings.Interval}}" required></div><button class="primary-action" type="submit">Save GC Settings</button></form><p class="muted">GC only removes untagged manifest records after the grace period. Blob/layer cleanup is intentionally not enabled yet because blobs can be shared across manifests.</p></section>

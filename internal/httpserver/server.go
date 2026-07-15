@@ -203,6 +203,11 @@ func (s *Server) handleRegistry(w http.ResponseWriter, r *http.Request) {
 	principal, authenticated := s.principalFromBearer(r)
 	if route.kind == registryRouteCatalog {
 		if !authenticated || principal.Role != domain.RoleAdmin {
+			if authenticated {
+				if err := s.auditWithActor(r, principal, "registry.access.denied", "catalog", "_catalog", "denied"); err != nil {
+					s.logger.Error("failed to write audit event", "error", err)
+				}
+			}
 			s.challenge(w, r, "")
 			return
 		}
@@ -212,6 +217,11 @@ func (s *Server) handleRegistry(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !authenticated || !auth.HasAccess(principal.Access, route.repository, route.action) {
+		if authenticated {
+			if err := s.auditWithActor(r, principal, "registry.access.denied", "repository", route.repository, "denied"); err != nil {
+				s.logger.Error("failed to write audit event", "error", err)
+			}
+		}
 		s.challenge(w, r, fmt.Sprintf("repository:%s:%s", route.repository, route.action))
 		return
 	}

@@ -356,6 +356,21 @@ func TestPullOnlyReaderCanListAndPullButNotPush(t *testing.T) {
 	if adminAPI.Code != http.StatusUnauthorized {
 		t.Fatalf("expected reader admin API request 401, got %d: %s", adminAPI.Code, adminAPI.Body.String())
 	}
+
+	events, err := store.ListAuditEvents(ctx, 100)
+	if err != nil {
+		t.Fatalf("ListAuditEvents() error = %v", err)
+	}
+	deniedByTarget := map[string]bool{}
+	for _, event := range events {
+		if event.Action != "registry.access.denied" || event.Result != "denied" || event.ActorUserID == nil || *event.ActorUserID != reader.ID {
+			continue
+		}
+		deniedByTarget[event.TargetType+":"+event.TargetID] = true
+	}
+	if !deniedByTarget["repository:team-read/app"] || !deniedByTarget["catalog:_catalog"] {
+		t.Fatalf("expected registry denial audit events for reader, got %#v", events)
+	}
 }
 
 func TestOCIConformanceProtocolEdges(t *testing.T) {
@@ -851,6 +866,12 @@ func TestUILoginAndDashboard(t *testing.T) {
 	if !strings.Contains(auditResponse.Body.String(), "Filter by action, user, target, result, IP, or user agent") {
 		t.Fatalf("expected real audit filter controls, got %s", auditResponse.Body.String())
 	}
+	if !strings.Contains(auditResponse.Body.String(), "grant | ui-reader | team/ | pull, push") || strings.Contains(auditResponse.Body.String(), "grnt_") {
+		t.Fatalf("expected human-readable grant audit target, got %s", auditResponse.Body.String())
+	}
+	if strings.Contains(auditResponse.Body.String(), `>denied</span>`) && !strings.Contains(auditResponse.Body.String(), `class="badge denied"`) {
+		t.Fatalf("expected denied audit results to use denied badge styling, got %s", auditResponse.Body.String())
+	}
 
 	auditSearchRequest := httptest.NewRequest(http.MethodGet, "/ui/audit?q=ui-reader", nil)
 	auditSearchRequest.AddCookie(sessionCookie)
@@ -1056,6 +1077,15 @@ func TestUILoginCanDisableSecureCookieForDirectHTTP(t *testing.T) {
 	sessionCookie := loginResponse.Result().Cookies()[0]
 	if sessionCookie.Secure || !sessionCookie.HttpOnly || sessionCookie.SameSite != http.SameSiteLaxMode {
 		t.Fatalf("expected insecure opt-out to affect only Secure flag, got %#v", sessionCookie)
+	}
+}
+
+func TestAuditResultClassStylesDeniedResult(t *testing.T) {
+	if got := auditResultClass("denied"); got != "badge denied" {
+		t.Fatalf("expected denied result badge styling, got %q", got)
+	}
+	if got := auditResultClass("success"); got != "badge success" {
+		t.Fatalf("expected success result badge styling, got %q", got)
 	}
 }
 

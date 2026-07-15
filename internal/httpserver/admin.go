@@ -71,7 +71,7 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if err := s.audit(r, "grant.created", "grant", grant.ID, "success"); err != nil {
+		if err := s.audit(r, "grant.created", "grant", s.auditGrantTarget(r.Context(), grant), "success"); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to write audit event")
 			return
 		}
@@ -162,7 +162,7 @@ func (s *Server) handleCreateGrant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.audit(r, "grant.created", "grant", grant.ID, "success"); err != nil {
+	if err := s.audit(r, "grant.created", "grant", s.auditGrantTarget(r.Context(), grant), "success"); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to write audit event")
 		return
 	}
@@ -180,11 +180,12 @@ func (s *Server) handleListGrants(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteGrant(w http.ResponseWriter, r *http.Request) {
 	grantID := r.PathValue("id")
+	grantTarget := s.auditGrantTargetByID(r.Context(), grantID)
 	if err := s.store.DeleteGrant(r.Context(), grantID); err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	if err := s.audit(r, "grant.deleted", "grant", grantID, "success"); err != nil {
+	if err := s.audit(r, "grant.deleted", "grant", grantTarget, "success"); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to write audit event")
 		return
 	}
