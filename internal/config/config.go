@@ -20,8 +20,9 @@ type Config struct {
 }
 
 type HTTPConfig struct {
-	Address string `yaml:"address"`
-	Port    int    `yaml:"port"`
+	Address       string `yaml:"address"`
+	Port          int    `yaml:"port"`
+	SecureCookies bool   `yaml:"secureCookies"`
 }
 
 type StorageConfig struct {
@@ -82,8 +83,9 @@ func (c *Config) applyEnvironment() {
 func Default() Config {
 	return Config{
 		HTTP: HTTPConfig{
-			Address: "0.0.0.0",
-			Port:    5000,
+			Address:       "0.0.0.0",
+			Port:          5000,
+			SecureCookies: true,
 		},
 		Storage: StorageConfig{
 			RootDirectory: "/var/lib/scr/registry",

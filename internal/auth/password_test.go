@@ -32,3 +32,10 @@ func TestGenerateSecretReturnsOpaqueValue(t *testing.T) {
 		t.Fatalf("generated secret too short: %d", len(secret))
 	}
 }
+
+func TestVerifySecretRejectsParallelismOverflow(t *testing.T) {
+	encoded := "$argon2id$v=19$m=65536,t=3,p=256$c2FsdHNhbHRzYWx0c2FsdA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	if _, err := VerifySecret("secret", encoded); err == nil {
+		t.Fatal("expected VerifySecret to reject p value that overflows uint8")
+	}
+}

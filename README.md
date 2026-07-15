@@ -52,6 +52,7 @@ The published Docker image starts SCR with `-config /etc/scr/config.yaml`. The i
 http:
   address: "0.0.0.0"
   port: 5000
+  secureCookies: true
 
 storage:
   rootDirectory: "/var/lib/scr/registry"
@@ -84,6 +85,7 @@ docker run --rm --name scr \
 Configuration supports these sections:
 
 - `http.address` and `http.port`
+- `http.secureCookies`; defaults to `true`. Leave enabled when SCR is accessed over HTTPS, including behind an HTTPS-terminating reverse proxy. Set to `false` only when serving the admin UI directly over plain HTTP.
 - `storage.rootDirectory`
 - `storage.gc`
 - `storage.gcDelay`
@@ -110,6 +112,14 @@ Bootstrap admin username and password are normally provided with environment var
 - `SCR_BOOTSTRAP_ADMIN_PASSWORD`
 
 If bootstrap admin values are omitted from the config file, SCR fills them from those environment variables. Provide both values together.
+
+### Admin UI cookies and reverse proxies
+
+SCR stores admin UI sessions in an `HttpOnly`, `SameSite=Lax` cookie. By default, `http.secureCookies` is `true`, which also marks that cookie `Secure` so browsers only send it over HTTPS.
+
+Keep `http.secureCookies: true` for production deployments, including the common setup where a reverse proxy terminates HTTPS and forwards plain HTTP to SCR. The browser only sees the public HTTPS URL, so the `Secure` cookie works normally even if the proxy-to-SCR hop is HTTP.
+
+Set `http.secureCookies: false` only when users access SCR directly over plain HTTP, such as a local development instance or a trusted internal HTTP-only deployment. Do not disable it for an HTTPS reverse-proxy deployment.
 
 ## Authentication and access
 

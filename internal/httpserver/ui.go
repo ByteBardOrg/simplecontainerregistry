@@ -233,6 +233,7 @@ func (s *Server) handleUILoginPost(w http.ResponseWriter, r *http.Request) {
 		Value:    token,
 		Path:     "/",
 		Expires:  expiresAt,
+		Secure:   s.cfg.HTTP.SecureCookies,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
@@ -245,6 +246,7 @@ func (s *Server) handleUILogout(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
+		Secure:   s.cfg.HTTP.SecureCookies,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})

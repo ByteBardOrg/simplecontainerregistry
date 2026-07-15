@@ -1,6 +1,8 @@
 http:
   address: "0.0.0.0"
   port: 5000
+  # Set true when accessing SCR through HTTPS, including an HTTPS-terminating reverse proxy.
+  secureCookies: false
 
 storage:
   rootDirectory: "data/registry"

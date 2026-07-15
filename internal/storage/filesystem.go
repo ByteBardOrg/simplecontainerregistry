@@ -17,8 +17,9 @@ import (
 )
 
 var (
-	ErrNotFound      = os.ErrNotExist
-	ErrInvalidDigest = errors.New("invalid digest")
+	ErrNotFound         = os.ErrNotExist
+	ErrInvalidDigest    = errors.New("invalid digest")
+	ErrInvalidReference = errors.New("invalid reference")
 )
 
 type Filesystem struct {
@@ -68,13 +69,22 @@ func (fs Filesystem) ManifestPath(repository, reference string) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	return fs.safeJoin("repositories", repoPath, "manifests", sanitizeReference(reference)), nil
+	referencePath, err := sanitizeReference(reference)
+	if err != nil {
+		return "", err
+	}
+	return fs.safeJoin("repositories", repoPath, "manifests", referencePath), nil
 }
 
 func (fs Filesystem) PutManifest(repository, reference, mediaType string, content []byte) (string, int64, error) {
 	repoPath, err := safeRepositoryPath(repository)
 	if err != nil {
 		return "", 0, err
+	}
+	if !strings.Contains(reference, ":") {
+		if _, err := sanitizeReference(reference); err != nil {
+			return "", 0, err
+		}
 	}
 	digest := digestForContent(manifestDigestAlgorithm(content), content)
 	if strings.Contains(reference, ":") {
@@ -130,7 +140,11 @@ func (fs Filesystem) GetManifest(repository, reference string) ([]byte, string, 
 	}
 	digest := reference
 	if !strings.Contains(reference, ":") {
-		tagPath := fs.safeJoin("repositories", repoPath, "tags", sanitizeReference(reference))
+		tag, err := sanitizeReference(reference)
+		if err != nil {
+			return nil, "", "", err
+		}
+		tagPath := fs.safeJoin("repositories", repoPath, "tags", tag)
 		data, err := os.ReadFile(tagPath)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -168,7 +182,11 @@ func (fs Filesystem) DeleteManifest(repository, reference string) (string, error
 	}
 	digest := reference
 	if !strings.Contains(reference, ":") {
-		tagPath := fs.safeJoin("repositories", repoPath, "tags", sanitizeReference(reference))
+		tag, err := sanitizeReference(reference)
+		if err != nil {
+			return "", err
+		}
+		tagPath := fs.safeJoin("repositories", repoPath, "tags", tag)
 		data, err := os.ReadFile(tagPath)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -512,7 +530,11 @@ func (fs Filesystem) manifestDigestPath(repoPath, digest string) (string, error)
 }
 
 func (fs Filesystem) linkManifestTag(repoPath, tag, digest string) error {
-	tagPath := fs.safeJoin("repositories", repoPath, "tags", sanitizeReference(tag))
+	tagPathName, err := sanitizeReference(tag)
+	if err != nil {
+		return err
+	}
+	tagPath := fs.safeJoin("repositories", repoPath, "tags", tagPathName)
 	if err := os.MkdirAll(filepath.Dir(tagPath), 0o750); err != nil {
 		return err
 	}
@@ -668,8 +690,15 @@ func safeRepositoryPath(repository string) (string, error) {
 	return repository, nil
 }
 
-func sanitizeReference(reference string) string {
-	reference = strings.ReplaceAll(reference, "/", "_")
-	reference = strings.ReplaceAll(reference, ":", "_")
-	return reference
+func sanitizeReference(reference string) (string, error) {
+	if reference == "" || strings.Contains(reference, "/") || strings.Contains(reference, `\`) || strings.Contains(reference, "..") {
+		return "", fmt.Errorf("%w: %q", ErrInvalidReference, reference)
+	}
+	for _, r := range reference {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+			continue
+		}
+		return "", fmt.Errorf("%w: %q", ErrInvalidReference, reference)
+	}
+	return reference, nil
 }

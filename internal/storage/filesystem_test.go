@@ -110,6 +110,36 @@ func TestCommitBlobFromUploadSupportsSHA512(t *testing.T) {
 	}
 }
 
+func TestFilesystemRejectsUnsafeTagReferences(t *testing.T) {
+	fs, err := NewFilesystem(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFilesystem() error = %v", err)
+	}
+	content := []byte(`{"schemaVersion":2}`)
+	digest, _, err := fs.PutManifest("team/app", "safe-1.0", "application/vnd.oci.image.manifest.v1+json", content)
+	if err != nil {
+		t.Fatalf("PutManifest(safe) error = %v", err)
+	}
+
+	unsafeTags := []string{"", "../secret", "nested/tag", `nested\tag`, "dot..dot", "bad:tag", "bad tag", "bad@tag"}
+	for _, tag := range unsafeTags {
+		t.Run(tag, func(t *testing.T) {
+			if _, _, err := fs.PutManifest("team/app", tag, "application/vnd.oci.image.manifest.v1+json", content); err == nil {
+				t.Fatal("expected PutManifest to reject unsafe tag")
+			}
+			if err := fs.LinkManifestTag("team/app", tag, digest); err == nil {
+				t.Fatal("expected LinkManifestTag to reject unsafe tag")
+			}
+			if _, _, _, err := fs.GetManifest("team/app", tag); err == nil {
+				t.Fatal("expected GetManifest to reject unsafe tag")
+			}
+			if _, err := fs.DeleteManifest("team/app", tag); err == nil {
+				t.Fatal("expected DeleteManifest to reject unsafe tag")
+			}
+		})
+	}
+}
+
 func touchTree(path string, at time.Time) error {
 	return os.Chtimes(path, at, at)
 }

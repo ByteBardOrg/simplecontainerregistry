@@ -83,6 +83,9 @@ func decodeHash(encoded string) (argonParams, []byte, []byte, error) {
 		case "t":
 			params.iterations = uint32(parsed)
 		case "p":
+			if parsed > 255 {
+				return argonParams{}, nil, nil, errors.New("secret hash parallelism is too large")
+			}
 			params.parallelism = uint8(parsed)
 		default:
 			return argonParams{}, nil, nil, fmt.Errorf("unknown secret hash param %q", name)

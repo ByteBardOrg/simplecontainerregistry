@@ -530,9 +530,28 @@ func TestUILoginAndDashboard(t *testing.T) {
 	if len(loginResponse.Result().Cookies()) == 0 {
 		t.Fatal("expected session cookie")
 	}
+	sessionCookie := loginResponse.Result().Cookies()[0]
+	if !sessionCookie.Secure || !sessionCookie.HttpOnly || sessionCookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("expected secure HttpOnly SameSite=Lax session cookie, got %#v", sessionCookie)
+	}
+
+	logoutRequest := httptest.NewRequest(http.MethodPost, "/ui/logout", nil)
+	logoutRequest.AddCookie(sessionCookie)
+	logoutResponse := httptest.NewRecorder()
+	handler.ServeHTTP(logoutResponse, logoutRequest)
+	if logoutResponse.Code != http.StatusFound {
+		t.Fatalf("expected logout redirect, got %d: %s", logoutResponse.Code, logoutResponse.Body.String())
+	}
+	if len(logoutResponse.Result().Cookies()) == 0 {
+		t.Fatal("expected logout clearing cookie")
+	}
+	clearedCookie := logoutResponse.Result().Cookies()[0]
+	if !clearedCookie.Secure || !clearedCookie.HttpOnly || clearedCookie.SameSite != http.SameSiteLaxMode || clearedCookie.MaxAge != -1 {
+		t.Fatalf("expected secure clearing cookie, got %#v", clearedCookie)
+	}
 
 	dashboardRequest := httptest.NewRequest(http.MethodGet, "/ui", nil)
-	dashboardRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	dashboardRequest.AddCookie(sessionCookie)
 	dashboardResponse := httptest.NewRecorder()
 	handler.ServeHTTP(dashboardResponse, dashboardRequest)
 	if dashboardResponse.Code != http.StatusOK {
@@ -549,7 +568,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	}
 
 	settingsRequest := httptest.NewRequest(http.MethodGet, "/ui/settings", nil)
-	settingsRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	settingsRequest.AddCookie(sessionCookie)
 	settingsResponse := httptest.NewRecorder()
 	handler.ServeHTTP(settingsResponse, settingsRequest)
 	if settingsResponse.Code != http.StatusOK {
@@ -567,7 +586,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	settingsForm.Set("interval", "2h")
 	settingsUpdateRequest := httptest.NewRequest(http.MethodPost, "/ui/settings/gc", strings.NewReader(settingsForm.Encode()))
 	settingsUpdateRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	settingsUpdateRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	settingsUpdateRequest.AddCookie(sessionCookie)
 	settingsUpdateResponse := httptest.NewRecorder()
 	handler.ServeHTTP(settingsUpdateResponse, settingsUpdateRequest)
 	if settingsUpdateResponse.Code != http.StatusFound {
@@ -584,7 +603,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	webhookForm.Set("url", "https://example.com/scr-events")
 	webhookUpdateRequest := httptest.NewRequest(http.MethodPost, "/ui/settings/webhook", strings.NewReader(webhookForm.Encode()))
 	webhookUpdateRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	webhookUpdateRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	webhookUpdateRequest.AddCookie(sessionCookie)
 	webhookUpdateResponse := httptest.NewRecorder()
 	handler.ServeHTTP(webhookUpdateResponse, webhookUpdateRequest)
 	if webhookUpdateResponse.Code != http.StatusFound {
@@ -614,7 +633,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 		}
 	}
 	trafficRequest := httptest.NewRequest(http.MethodGet, "/ui?repository="+url.QueryEscape("ui/app"), nil)
-	trafficRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	trafficRequest.AddCookie(sessionCookie)
 	trafficResponse := httptest.NewRecorder()
 	handler.ServeHTTP(trafficResponse, trafficRequest)
 	if trafficResponse.Code != http.StatusOK {
@@ -627,7 +646,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 		t.Fatalf("expected filtered dashboard traffic for ui/app, got %s", trafficResponse.Body.String())
 	}
 	repositoriesRequest := httptest.NewRequest(http.MethodGet, "/ui/repositories", nil)
-	repositoriesRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	repositoriesRequest.AddCookie(sessionCookie)
 	repositoriesResponse := httptest.NewRecorder()
 	handler.ServeHTTP(repositoriesResponse, repositoriesRequest)
 	if repositoriesResponse.Code != http.StatusOK {
@@ -652,7 +671,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 		t.Fatalf("expected tag delete semantics copy, got %s", repositoriesResponse.Body.String())
 	}
 	searchRequest := httptest.NewRequest(http.MethodGet, "/ui/repositories?q=stable", nil)
-	searchRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	searchRequest.AddCookie(sessionCookie)
 	searchResponse := httptest.NewRecorder()
 	handler.ServeHTTP(searchResponse, searchRequest)
 	if searchResponse.Code != http.StatusOK {
@@ -662,7 +681,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 		t.Fatalf("expected repository search to preserve query and return tag match, got %s", searchResponse.Body.String())
 	}
 	missingSearchRequest := httptest.NewRequest(http.MethodGet, "/ui/repositories?q=no-such-tag", nil)
-	missingSearchRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	missingSearchRequest.AddCookie(sessionCookie)
 	missingSearchResponse := httptest.NewRecorder()
 	handler.ServeHTTP(missingSearchResponse, missingSearchRequest)
 	if missingSearchResponse.Code != http.StatusOK {
@@ -677,7 +696,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	deleteTagForm.Set("tag", "latest")
 	deleteTagRequest := httptest.NewRequest(http.MethodPost, "/ui/repositories/delete-tag", strings.NewReader(deleteTagForm.Encode()))
 	deleteTagRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	deleteTagRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	deleteTagRequest.AddCookie(sessionCookie)
 	deleteTagResponse := httptest.NewRecorder()
 	handler.ServeHTTP(deleteTagResponse, deleteTagRequest)
 	if deleteTagResponse.Code != http.StatusFound {
@@ -696,7 +715,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	deleteRepositoryForm.Set("repository", "ui/app")
 	deleteRepositoryRequest := httptest.NewRequest(http.MethodPost, "/ui/repositories/delete", strings.NewReader(deleteRepositoryForm.Encode()))
 	deleteRepositoryRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	deleteRepositoryRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	deleteRepositoryRequest.AddCookie(sessionCookie)
 	deleteRepositoryResponse := httptest.NewRecorder()
 	handler.ServeHTTP(deleteRepositoryResponse, deleteRepositoryRequest)
 	if deleteRepositoryResponse.Code != http.StatusFound {
@@ -714,7 +733,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	createUserForm.Set("expiresAt", "2026-08-02")
 	createUserRequest := httptest.NewRequest(http.MethodPost, "/ui/users", strings.NewReader(createUserForm.Encode()))
 	createUserRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	createUserRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	createUserRequest.AddCookie(sessionCookie)
 	createUserResponse := httptest.NewRecorder()
 	handler.ServeHTTP(createUserResponse, createUserRequest)
 	if createUserResponse.Code != http.StatusOK {
@@ -725,7 +744,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	}
 
 	usersRequest := httptest.NewRequest(http.MethodGet, "/ui/users", nil)
-	usersRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	usersRequest.AddCookie(sessionCookie)
 	usersResponse := httptest.NewRecorder()
 	handler.ServeHTTP(usersResponse, usersRequest)
 	if usersResponse.Code != http.StatusOK {
@@ -749,7 +768,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 		t.Fatalf("expected default wildcard pull grant, got %#v", grants)
 	}
 	usersWithGrantRequest := httptest.NewRequest(http.MethodGet, "/ui/users", nil)
-	usersWithGrantRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	usersWithGrantRequest.AddCookie(sessionCookie)
 	usersWithGrantResponse := httptest.NewRecorder()
 	handler.ServeHTTP(usersWithGrantResponse, usersWithGrantRequest)
 	if usersWithGrantResponse.Code != http.StatusOK {
@@ -774,7 +793,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	validityForm.Add("actions", "push")
 	validityRequest := httptest.NewRequest(http.MethodPost, "/ui/users/"+createdUser.ID+"/access", strings.NewReader(validityForm.Encode()))
 	validityRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	validityRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	validityRequest.AddCookie(sessionCookie)
 	validityResponse := httptest.NewRecorder()
 	handler.ServeHTTP(validityResponse, validityRequest)
 	if validityResponse.Code != http.StatusFound {
@@ -800,7 +819,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	}
 	adminValidityRequest := httptest.NewRequest(http.MethodPost, "/ui/users/"+adminUser.ID+"/access", strings.NewReader(validityForm.Encode()))
 	adminValidityRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	adminValidityRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	adminValidityRequest.AddCookie(sessionCookie)
 	adminValidityResponse := httptest.NewRecorder()
 	handler.ServeHTTP(adminValidityResponse, adminValidityRequest)
 	if adminValidityResponse.Code != http.StatusOK || !strings.Contains(adminValidityResponse.Body.String(), "Admin users are managed outside this user list") {
@@ -809,7 +828,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 
 	deleteUser := createHTTPTestUser(t, ctx, store, "delete-me", "Delete Me", domain.RoleReader, "delete-secret", time.Now().UTC())
 	deleteRequest := httptest.NewRequest(http.MethodPost, "/ui/users/"+deleteUser.ID+"/delete", nil)
-	deleteRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	deleteRequest.AddCookie(sessionCookie)
 	deleteResponse := httptest.NewRecorder()
 	handler.ServeHTTP(deleteResponse, deleteRequest)
 	if deleteResponse.Code != http.StatusFound {
@@ -820,7 +839,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	}
 
 	auditRequest := httptest.NewRequest(http.MethodGet, "/ui/audit", nil)
-	auditRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	auditRequest.AddCookie(sessionCookie)
 	auditResponse := httptest.NewRecorder()
 	handler.ServeHTTP(auditResponse, auditRequest)
 	if auditResponse.Code != http.StatusOK {
@@ -834,7 +853,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	}
 
 	auditSearchRequest := httptest.NewRequest(http.MethodGet, "/ui/audit?q=ui-reader", nil)
-	auditSearchRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	auditSearchRequest.AddCookie(sessionCookie)
 	auditSearchResponse := httptest.NewRecorder()
 	handler.ServeHTTP(auditSearchResponse, auditSearchRequest)
 	if auditSearchResponse.Code != http.StatusOK {
@@ -845,7 +864,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	}
 
 	authFilterRequest := httptest.NewRequest(http.MethodGet, "/ui/audit?action=authentication", nil)
-	authFilterRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	authFilterRequest.AddCookie(sessionCookie)
 	authFilterResponse := httptest.NewRecorder()
 	handler.ServeHTTP(authFilterResponse, authFilterRequest)
 	if authFilterResponse.Code != http.StatusOK {
@@ -856,7 +875,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	}
 
 	emptyAuditRequest := httptest.NewRequest(http.MethodGet, "/ui/audit?q=no-such-audit-event", nil)
-	emptyAuditRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	emptyAuditRequest.AddCookie(sessionCookie)
 	emptyAuditResponse := httptest.NewRecorder()
 	handler.ServeHTTP(emptyAuditResponse, emptyAuditRequest)
 	if emptyAuditResponse.Code != http.StatusOK {
@@ -997,6 +1016,47 @@ func TestRegistryWebhookFailureDoesNotFailRegistryRequest(t *testing.T) {
 		t.Fatalf("expected manifest push to ignore webhook failure, got %d: %s", putManifest.Code, putManifest.Body.String())
 	}
 	waitForWebhookAttempt(t, &attempts)
+}
+
+func TestUILoginCanDisableSecureCookieForDirectHTTP(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.HTTP.SecureCookies = false
+	cfg.Storage.RootDirectory = filepath.Join(t.TempDir(), "registry")
+	cfg.Database.DSN = filepath.Join(t.TempDir(), "test.db")
+	store, err := db.Open(ctx, cfg.Database.DSN)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.InitSchema(ctx); err != nil {
+		t.Fatalf("InitSchema() error = %v", err)
+	}
+	if err := store.EnsureActiveSigningKey(ctx); err != nil {
+		t.Fatalf("EnsureActiveSigningKey() error = %v", err)
+	}
+	if err := auth.BootstrapAdmin(ctx, store, "admin", "secret", time.Now().UTC()); err != nil {
+		t.Fatalf("BootstrapAdmin() error = %v", err)
+	}
+	handler := New(Options{Config: cfg, Store: store})
+
+	loginForm := url.Values{}
+	loginForm.Set("username", "admin")
+	loginForm.Set("password", "secret")
+	loginRequest := httptest.NewRequest(http.MethodPost, "/ui/login", strings.NewReader(loginForm.Encode()))
+	loginRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginResponse := httptest.NewRecorder()
+	handler.ServeHTTP(loginResponse, loginRequest)
+	if loginResponse.Code != http.StatusFound {
+		t.Fatalf("expected login redirect, got %d: %s", loginResponse.Code, loginResponse.Body.String())
+	}
+	if len(loginResponse.Result().Cookies()) == 0 {
+		t.Fatal("expected session cookie")
+	}
+	sessionCookie := loginResponse.Result().Cookies()[0]
+	if sessionCookie.Secure || !sessionCookie.HttpOnly || sessionCookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("expected insecure opt-out to affect only Secure flag, got %#v", sessionCookie)
+	}
 }
 
 func TestRootRedirectsToRegistryAPI(t *testing.T) {

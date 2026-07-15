@@ -15,6 +15,9 @@ func TestLoadDefaultsWhenConfigMissing(t *testing.T) {
 	if cfg.HTTP.Port != 5000 {
 		t.Fatalf("expected default port 5000, got %d", cfg.HTTP.Port)
 	}
+	if !cfg.HTTP.SecureCookies {
+		t.Fatal("expected secure cookies to be enabled by default")
+	}
 	if cfg.Storage.RootDirectory != "/var/lib/scr/registry" {
 		t.Fatalf("unexpected default storage root %q", cfg.Storage.RootDirectory)
 	}
@@ -45,6 +48,7 @@ func TestLoadParsesDurationFields(t *testing.T) {
 http:
   address: "127.0.0.1"
   port: 5000
+  secureCookies: false
 storage:
   rootDirectory: "/tmp/registry"
   gcDelay: "30m"
@@ -66,6 +70,9 @@ auth:
 	}
 	if cfg.Auth.TokenTTL.Std() != 5*time.Minute {
 		t.Fatalf("unexpected token ttl %s", cfg.Auth.TokenTTL.Std())
+	}
+	if cfg.HTTP.SecureCookies {
+		t.Fatal("expected secure cookies to be configurable")
 	}
 	if cfg.Storage.GCDelay.Std() != 30*time.Minute {
 		t.Fatalf("unexpected gc delay %s", cfg.Storage.GCDelay.Std())

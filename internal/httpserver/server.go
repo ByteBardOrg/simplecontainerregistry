@@ -772,6 +772,10 @@ func writeStorageError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "invalid digest")
 		return
 	}
+	if errors.Is(err, storage.ErrInvalidReference) {
+		writeError(w, http.StatusBadRequest, "invalid reference")
+		return
+	}
 	if errors.Is(err, storage.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "not found")
 		return
