@@ -64,6 +64,7 @@ func New(opts Options) http.Handler {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -216,7 +217,11 @@ func (s *Server) handleRegistry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !authenticated || !auth.HasAccess(principal.Access, route.repository, route.action) {
+	if !authenticated {
+		s.challenge(w, r, fmt.Sprintf("repository:%s:%s", route.repository, route.action))
+		return
+	}
+	if !auth.HasAccess(principal.Access, route.repository, route.action) {
 		if authenticated {
 			if err := s.auditWithActor(r, principal, "registry.access.denied", "repository", route.repository, "denied"); err != nil {
 				s.logger.Error("failed to write audit event", "error", err)
@@ -225,9 +230,37 @@ func (s *Server) handleRegistry(w http.ResponseWriter, r *http.Request) {
 		s.challenge(w, r, fmt.Sprintf("repository:%s:%s", route.repository, route.action))
 		return
 	}
+	currentAccess, err := s.hasCurrentRegistryAccess(r.Context(), principal, route.repository, route.action)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to verify current access")
+		return
+	}
+	if !currentAccess {
+		if err := s.auditWithActor(r, principal, "registry.access.denied", "repository", route.repository, "denied"); err != nil {
+			s.logger.Error("failed to write audit event", "error", err)
+		}
+		s.challenge(w, r, fmt.Sprintf("repository:%s:%s", route.repository, route.action))
+		return
+	}
 
 	w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
 	s.serveRegistryRoute(w, r.WithContext(contextWithPrincipal(r.Context(), principal)), route)
+}
+
+func (s *Server) hasCurrentRegistryAccess(ctx context.Context, principal auth.Principal, repository string, action domain.Action) (bool, error) {
+	if principal.Role == domain.RoleAdmin {
+		return true, nil
+	}
+	grants, err := s.store.ListGrantsByUser(ctx, principal.UserID)
+	if err != nil {
+		return false, err
+	}
+	access := auth.IntersectAccess(principal.Role, grants, []auth.RequestedScope{{
+		Type:    "repository",
+		Name:    repository,
+		Actions: []domain.Action{action},
+	}})
+	return auth.HasAccess(access, repository, action), nil
 }
 
 func (s *Server) serveRegistryRoute(w http.ResponseWriter, r *http.Request, route registryRoute) {
@@ -651,15 +684,33 @@ func (s *Server) challenge(w http.ResponseWriter, r *http.Request, scope string)
 }
 
 func (s *Server) realm(r *http.Request) string {
-	proto := r.Header.Get("X-Forwarded-Proto")
-	if proto == "" {
-		proto = "http"
+	if s.cfg.HTTP.PublicURL != "" {
+		return strings.TrimRight(s.cfg.HTTP.PublicURL, "/") + "/token"
+	}
+	proto := "http"
+	if r.TLS != nil {
+		proto = "https"
+	}
+	if s.cfg.HTTP.TrustForwardedHeaders {
+		if forwardedProto := firstForwardedValue(r.Header.Get("X-Forwarded-Proto")); forwardedProto == "http" || forwardedProto == "https" {
+			proto = forwardedProto
+		}
 	}
 	host := r.Host
+	if s.cfg.HTTP.TrustForwardedHeaders {
+		if forwardedHost := firstForwardedValue(r.Header.Get("X-Forwarded-Host")); forwardedHost != "" {
+			host = forwardedHost
+		}
+	}
 	if host == "" {
 		host = s.cfg.HTTP.ListenAddress()
 	}
 	return proto + "://" + host + "/token"
+}
+
+func firstForwardedValue(value string) string {
+	first, _, _ := strings.Cut(value, ",")
+	return strings.TrimSpace(first)
 }
 
 func parseRequestedScopes(rawScopes []string) ([]auth.RequestedScope, error) {
@@ -771,6 +822,13 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func setSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {

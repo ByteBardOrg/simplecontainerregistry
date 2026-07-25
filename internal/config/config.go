@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -20,9 +22,11 @@ type Config struct {
 }
 
 type HTTPConfig struct {
-	Address       string `yaml:"address"`
-	Port          int    `yaml:"port"`
-	SecureCookies bool   `yaml:"secureCookies"`
+	Address               string `yaml:"address"`
+	Port                  int    `yaml:"port"`
+	SecureCookies         bool   `yaml:"secureCookies"`
+	PublicURL             string `yaml:"publicURL"`
+	TrustForwardedHeaders bool   `yaml:"trustForwardedHeaders"`
 }
 
 type StorageConfig struct {
@@ -108,6 +112,15 @@ func Default() Config {
 func (c Config) Validate() error {
 	if c.HTTP.Port <= 0 || c.HTTP.Port > 65535 {
 		return fmt.Errorf("http.port must be between 1 and 65535")
+	}
+	if c.HTTP.PublicURL != "" {
+		parsed, err := url.ParseRequestURI(c.HTTP.PublicURL)
+		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return fmt.Errorf("http.publicURL must be an absolute http or https URL")
+		}
+		if parsed.RawQuery != "" || parsed.Fragment != "" || strings.Trim(parsed.Path, "/") != "" {
+			return fmt.Errorf("http.publicURL must not include path, query, or fragment")
+		}
 	}
 	if c.Storage.RootDirectory == "" {
 		return fmt.Errorf("storage.rootDirectory is required")

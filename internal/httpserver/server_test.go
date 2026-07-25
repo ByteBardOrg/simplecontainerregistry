@@ -336,6 +336,19 @@ func TestPullOnlyReaderCanListAndPullButNotPush(t *testing.T) {
 	if getManifest.Code != http.StatusOK {
 		t.Fatalf("expected reader manifest pull 200, got %d: %s", getManifest.Code, getManifest.Body.String())
 	}
+	readerGrants, err := store.ListGrantsByUser(ctx, reader.ID)
+	if err != nil {
+		t.Fatalf("ListGrantsByUser(reader) error = %v", err)
+	}
+	for _, grant := range readerGrants {
+		if err := store.DeleteGrant(ctx, grant.ID); err != nil {
+			t.Fatalf("DeleteGrant(reader) error = %v", err)
+		}
+	}
+	revokedPull := authenticatedRequest(handler, http.MethodGet, "/v2/team-read/app/manifests/v1", readerPullToken, nil)
+	if revokedPull.Code != http.StatusUnauthorized {
+		t.Fatalf("expected previously issued reader token to lose access after grant deletion, got %d: %s", revokedPull.Code, revokedPull.Body.String())
+	}
 	deleteAttempt := authenticatedRequest(handler, http.MethodDelete, "/v2/team-read/app/manifests/v1", readerPullToken, nil)
 	if deleteAttempt.Code != http.StatusUnauthorized {
 		t.Fatalf("expected pull-only reader delete 401, got %d: %s", deleteAttempt.Code, deleteAttempt.Body.String())
@@ -549,7 +562,9 @@ func TestUILoginAndDashboard(t *testing.T) {
 	if !sessionCookie.Secure || !sessionCookie.HttpOnly || sessionCookie.SameSite != http.SameSiteLaxMode {
 		t.Fatalf("expected secure HttpOnly SameSite=Lax session cookie, got %#v", sessionCookie)
 	}
-
+	if sessionCookie.Path != adminCookiePath {
+		t.Fatalf("expected admin cookie path %q, got %q", adminCookiePath, sessionCookie.Path)
+	}
 	logoutRequest := httptest.NewRequest(http.MethodPost, "/ui/logout", nil)
 	logoutRequest.AddCookie(sessionCookie)
 	logoutResponse := httptest.NewRecorder()
@@ -563,6 +578,9 @@ func TestUILoginAndDashboard(t *testing.T) {
 	clearedCookie := logoutResponse.Result().Cookies()[0]
 	if !clearedCookie.Secure || !clearedCookie.HttpOnly || clearedCookie.SameSite != http.SameSiteLaxMode || clearedCookie.MaxAge != -1 {
 		t.Fatalf("expected secure clearing cookie, got %#v", clearedCookie)
+	}
+	if clearedCookie.Path != adminCookiePath {
+		t.Fatalf("expected cleared admin cookie path %q, got %q", adminCookiePath, clearedCookie.Path)
 	}
 
 	dashboardRequest := httptest.NewRequest(http.MethodGet, "/ui", nil)
@@ -948,6 +966,7 @@ func TestRegistryWebhookReceivesRegistryAndUIDeleteEvents(t *testing.T) {
 	}
 
 	handler := New(Options{Config: cfg, Store: store})
+	handler.(*Server).webhooks.client = webhookServer.Client()
 	token := requestToken(t, handler, "admin", "secret", "repository:webhook/app:pull,push,delete")
 	manifest := []byte(`{"schemaVersion":2}`)
 	putManifest := httptest.NewRecorder()
@@ -1027,6 +1046,7 @@ func TestRegistryWebhookFailureDoesNotFailRegistryRequest(t *testing.T) {
 	}
 
 	handler := New(Options{Config: cfg, Store: store})
+	handler.(*Server).webhooks.client = failingWebhookServer.Client()
 	token := requestToken(t, handler, "admin", "secret", "repository:webhook-failure/app:push")
 	putManifest := httptest.NewRecorder()
 	putRequest := httptest.NewRequest(http.MethodPut, "/v2/webhook-failure/app/manifests/latest", bytes.NewReader([]byte(`{"schemaVersion":2}`)))
@@ -1037,6 +1057,25 @@ func TestRegistryWebhookFailureDoesNotFailRegistryRequest(t *testing.T) {
 		t.Fatalf("expected manifest push to ignore webhook failure, got %d: %s", putManifest.Code, putManifest.Body.String())
 	}
 	waitForWebhookAttempt(t, &attempts)
+}
+
+func TestRegistryWebhookURLRejectsPrivateAddresses(t *testing.T) {
+	unsafeURLs := []string{
+		"http://127.0.0.1/events",
+		"http://10.0.0.5/events",
+		"http://169.254.169.254/latest/meta-data/",
+		"http://[::1]/events",
+	}
+	for _, raw := range unsafeURLs {
+		t.Run(raw, func(t *testing.T) {
+			if err := validateRegistryWebhookURL(raw); err == nil {
+				t.Fatal("expected private or reserved webhook target to be rejected")
+			}
+		})
+	}
+	if err := validateRegistryWebhookURL("https://example.com/scr-events"); err != nil {
+		t.Fatalf("expected public hostname webhook URL to be accepted, got %v", err)
+	}
 }
 
 func TestUILoginCanDisableSecureCookieForDirectHTTP(t *testing.T) {

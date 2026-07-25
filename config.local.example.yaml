@@ -3,6 +3,8 @@ http:
   port: 5000
   # Set true when accessing SCR through HTTPS, including an HTTPS-terminating reverse proxy.
   secureCookies: false
+  publicURL: ""
+  trustForwardedHeaders: false
 
 storage:
   rootDirectory: "data/registry"

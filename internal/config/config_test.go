@@ -49,6 +49,8 @@ http:
   address: "127.0.0.1"
   port: 5000
   secureCookies: false
+  publicURL: "https://registry.example.test"
+  trustForwardedHeaders: true
 storage:
   rootDirectory: "/tmp/registry"
   gcDelay: "30m"
@@ -74,7 +76,18 @@ auth:
 	if cfg.HTTP.SecureCookies {
 		t.Fatal("expected secure cookies to be configurable")
 	}
+	if cfg.HTTP.PublicURL != "https://registry.example.test" || !cfg.HTTP.TrustForwardedHeaders {
+		t.Fatalf("unexpected http proxy config: %#v", cfg.HTTP)
+	}
 	if cfg.Storage.GCDelay.Std() != 30*time.Minute {
 		t.Fatalf("unexpected gc delay %s", cfg.Storage.GCDelay.Std())
+	}
+}
+
+func TestValidateRejectsInvalidPublicURL(t *testing.T) {
+	cfg := Default()
+	cfg.HTTP.PublicURL = "https://registry.example.test/path"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected public url with path to be rejected")
 	}
 }

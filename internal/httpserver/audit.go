@@ -36,7 +36,7 @@ func (s *Server) audit(r *http.Request, action, targetType, targetID, result str
 		TargetType:  targetType,
 		TargetID:    targetID,
 		Result:      result,
-		IPAddress:   requestIP(r),
+		IPAddress:   s.requestIP(r),
 		UserAgent:   r.UserAgent(),
 		CreatedAt:   time.Now().UTC(),
 	})
@@ -50,7 +50,7 @@ func (s *Server) auditWithActor(r *http.Request, principal auth.Principal, actio
 		TargetType:  targetType,
 		TargetID:    targetID,
 		Result:      result,
-		IPAddress:   requestIP(r),
+		IPAddress:   s.requestIP(r),
 		UserAgent:   r.UserAgent(),
 		CreatedAt:   time.Now().UTC(),
 	})
@@ -62,7 +62,7 @@ func (s *Server) auditAnonymous(r *http.Request, action, targetType, targetID, r
 		TargetType: targetType,
 		TargetID:   targetID,
 		Result:     result,
-		IPAddress:  requestIP(r),
+		IPAddress:  s.requestIP(r),
 		UserAgent:  r.UserAgent(),
 		CreatedAt:  time.Now().UTC(),
 	})
@@ -114,13 +114,15 @@ func auditActionsLabel(actions []domain.Action) string {
 	return strings.Join(parts, ", ")
 }
 
-func requestIP(r *http.Request) string {
-	if forwardedFor := r.Header.Get("X-Forwarded-For"); forwardedFor != "" {
-		first, _, _ := strings.Cut(forwardedFor, ",")
-		return strings.TrimSpace(first)
-	}
-	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
-		return realIP
+func (s *Server) requestIP(r *http.Request) string {
+	if s.cfg.HTTP.TrustForwardedHeaders {
+		if forwardedFor := r.Header.Get("X-Forwarded-For"); forwardedFor != "" {
+			first, _, _ := strings.Cut(forwardedFor, ",")
+			return strings.TrimSpace(first)
+		}
+		if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+			return realIP
+		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

@@ -2,6 +2,8 @@ http:
   address: "0.0.0.0"
   port: 5000
   secureCookies: true
+  publicURL: ""
+  trustForwardedHeaders: false
 
 storage:
   rootDirectory: "/var/lib/scr/registry"

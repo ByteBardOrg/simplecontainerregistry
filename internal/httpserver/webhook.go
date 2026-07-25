@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -39,11 +41,40 @@ func newRegistryWebhookDispatcher(store *db.Store, logger *slog.Logger) *registr
 	dispatcher := &registryWebhookDispatcher{
 		store:  store,
 		logger: logger,
-		client: &http.Client{Timeout: 2 * time.Second},
+		client: &http.Client{Timeout: 2 * time.Second, Transport: safeWebhookTransport()},
 		events: make(chan domain.AuditEvent, registryWebhookQueueSize),
 	}
 	go dispatcher.run()
 	return dispatcher
+}
+
+func safeWebhookTransport() http.RoundTripper {
+	dialer := &net.Dialer{Timeout: 2 * time.Second}
+	return &http.Transport{
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			if len(ips) == 0 {
+				return nil, fmt.Errorf("webhook host has no addresses")
+			}
+			for _, ip := range ips {
+				if unsafeWebhookIP(ip.IP) {
+					return nil, fmt.Errorf("webhook host resolves to a private or reserved address")
+				}
+			}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+		},
+	}
+}
+
+func unsafeWebhookIP(ip net.IP) bool {
+	return ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast()
 }
 
 func (d *registryWebhookDispatcher) Enqueue(event domain.AuditEvent) {

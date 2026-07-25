@@ -53,6 +53,8 @@ http:
   address: "0.0.0.0"
   port: 5000
   secureCookies: true
+  publicURL: ""
+  trustForwardedHeaders: false
 
 storage:
   rootDirectory: "/var/lib/scr/registry"
@@ -86,6 +88,8 @@ Configuration supports these sections:
 
 - `http.address` and `http.port`
 - `http.secureCookies`; defaults to `true`. Leave enabled when SCR is accessed over HTTPS, including behind an HTTPS-terminating reverse proxy. Set to `false` only when serving the admin UI directly over plain HTTP.
+- `http.publicURL`; optional public origin such as `https://registry.example.com`, used for token-service challenge URLs when SCR is behind a reverse proxy.
+- `http.trustForwardedHeaders`; defaults to `false`. Enable only when SCR is reachable exclusively through a trusted reverse proxy that controls `X-Forwarded-*` headers.
 - `storage.rootDirectory`
 - `storage.gc`
 - `storage.gcDelay`
@@ -118,6 +122,8 @@ If bootstrap admin values are omitted from the config file, SCR fills them from 
 SCR stores admin UI sessions in an `HttpOnly`, `SameSite=Lax` cookie. By default, `http.secureCookies` is `true`, which also marks that cookie `Secure` so browsers only send it over HTTPS.
 
 Keep `http.secureCookies: true` for production deployments, including the common setup where a reverse proxy terminates HTTPS and forwards plain HTTP to SCR. The browser only sees the public HTTPS URL, so the `Secure` cookie works normally even if the proxy-to-SCR hop is HTTP.
+
+When SCR is behind a reverse proxy, prefer setting `http.publicURL` to the public registry origin. Only enable `http.trustForwardedHeaders` if direct client traffic cannot reach SCR and the proxy overwrites untrusted `X-Forwarded-For`, `X-Forwarded-Host`, and `X-Forwarded-Proto` input.
 
 Set `http.secureCookies: false` only when users access SCR directly over plain HTTP, such as a local development instance or a trusted internal HTTP-only deployment. Do not disable it for an HTTPS reverse-proxy deployment.
 
@@ -159,6 +165,8 @@ Security and storage behavior:
 Admins can configure a registry webhook URL from `/ui/settings`. Leave the URL empty to disable delivery.
 
 SCR sends registry webhooks as best-effort HTTP `POST` requests with `Content-Type: application/json` and `User-Agent: simplecontainerregistry-webhook`. Webhook delivery is asynchronous, has a short timeout, and does not fail the original registry or admin UI request if the destination is slow, unavailable, or returns a non-2xx response.
+
+Webhook delivery rejects loopback, private, link-local, multicast, and unspecified IP destinations, including hostnames that resolve to those addresses.
 
 Delivered events:
 

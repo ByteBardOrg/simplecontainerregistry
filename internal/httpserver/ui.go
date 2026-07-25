@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -17,6 +18,7 @@ import (
 )
 
 const adminCookieName = "scr_admin"
+const adminCookiePath = "/ui"
 
 var uiTemplates = template.Must(template.New("ui").Funcs(template.FuncMap{
 	"time": func(value *time.Time) string {
@@ -190,12 +192,12 @@ func (s *Server) handleUITrailingSlash(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUILogin(w http.ResponseWriter, r *http.Request) {
-	s.renderUI(w, "login", uiPage{Title: "Sign In"})
+	s.renderUI(w, r, "login", uiPage{Title: "Sign In"})
 }
 
 func (s *Server) handleUILoginPost(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		s.renderUI(w, "login", uiPage{Title: "Sign In", Error: "Invalid form submission"})
+		s.renderUI(w, r, "login", uiPage{Title: "Sign In", Error: "Invalid form submission"})
 		return
 	}
 	now := time.Now().UTC()
@@ -204,13 +206,13 @@ func (s *Server) handleUILoginPost(w http.ResponseWriter, r *http.Request) {
 		if auditErr := s.auditAnonymous(r, "ui.login.denied", "username", r.FormValue("username"), "invalid_credentials"); auditErr != nil {
 			s.logger.Error("failed to write audit event", "error", auditErr)
 		}
-		s.renderUI(w, "login", uiPage{Title: "Sign In", Error: "Invalid admin credentials"})
+		s.renderUI(w, r, "login", uiPage{Title: "Sign In", Error: "Invalid admin credentials"})
 		return
 	}
 
 	token, expiresAt, err := s.tokens.Mint(r.Context(), authenticated.User, nil, now)
 	if err != nil {
-		s.renderUI(w, "login", uiPage{Title: "Sign In", Error: "Failed to create session"})
+		s.renderUI(w, r, "login", uiPage{Title: "Sign In", Error: "Failed to create session"})
 		return
 	}
 	if err := s.auditWithActor(r, auth.Principal{
@@ -219,14 +221,14 @@ func (s *Server) handleUILoginPost(w http.ResponseWriter, r *http.Request) {
 		Role:     authenticated.User.Role,
 	}, "ui.login", "user", authenticated.User.ID, "success"); err != nil {
 		s.logger.Error("failed to write audit event", "error", err)
-		s.renderUI(w, "login", uiPage{Title: "Sign In", Error: "Failed to audit session"})
+		s.renderUI(w, r, "login", uiPage{Title: "Sign In", Error: "Failed to audit session"})
 		return
 	}
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     adminCookieName,
 		Value:    token,
-		Path:     "/",
+		Path:     adminCookiePath,
 		Expires:  expiresAt,
 		Secure:   s.cfg.HTTP.SecureCookies,
 		HttpOnly: true,
@@ -239,7 +241,7 @@ func (s *Server) handleUILogout(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     adminCookieName,
 		Value:    "",
-		Path:     "/",
+		Path:     adminCookiePath,
 		MaxAge:   -1,
 		Secure:   s.cfg.HTTP.SecureCookies,
 		HttpOnly: true,
@@ -252,22 +254,22 @@ func (s *Server) handleUIDashboard(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	summary, err := s.store.DashboardSummary(r.Context(), now)
 	if err != nil {
-		s.renderUI(w, "dashboard", uiPage{Title: "Dashboard", Active: "dashboard", Error: "Failed to load dashboard"})
+		s.renderUI(w, r, "dashboard", uiPage{Title: "Dashboard", Active: "dashboard", Error: "Failed to load dashboard"})
 		return
 	}
 	repositories, err := s.store.ListRepositories(r.Context())
 	if err != nil {
-		s.renderUI(w, "dashboard", uiPage{Title: "Dashboard", Active: "dashboard", Summary: summary, Error: "Failed to load repositories"})
+		s.renderUI(w, r, "dashboard", uiPage{Title: "Dashboard", Active: "dashboard", Summary: summary, Error: "Failed to load repositories"})
 		return
 	}
 	selectedTraffic := selectedTrafficRepository(repositories, r.URL.Query().Get("repository"))
 	usage, err := s.store.DailyUsage(r.Context(), now, 7, selectedTraffic)
 	if err != nil {
-		s.renderUI(w, "dashboard", uiPage{Title: "Dashboard", Active: "dashboard", Summary: summary, TrafficRepos: buildTrafficRepositoryGroups(repositories), SelectedTraffic: selectedTraffic, Error: "Failed to load traffic counters"})
+		s.renderUI(w, r, "dashboard", uiPage{Title: "Dashboard", Active: "dashboard", Summary: summary, TrafficRepos: buildTrafficRepositoryGroups(repositories), SelectedTraffic: selectedTraffic, Error: "Failed to load traffic counters"})
 		return
 	}
 	traffic, total := buildTrafficView(usage)
-	s.renderUI(w, "dashboard", uiPage{Title: "Dashboard", Active: "dashboard", Summary: summary, Traffic: traffic, TrafficTotal: total, TrafficRepos: buildTrafficRepositoryGroups(repositories), SelectedTraffic: selectedTraffic})
+	s.renderUI(w, r, "dashboard", uiPage{Title: "Dashboard", Active: "dashboard", Summary: summary, Traffic: traffic, TrafficTotal: total, TrafficRepos: buildTrafficRepositoryGroups(repositories), SelectedTraffic: selectedTraffic})
 }
 
 func selectedTrafficRepository(repositories []domain.Repository, requested string) string {
@@ -347,10 +349,10 @@ func (s *Server) handleUIRepositories(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	repos, err := s.loadRepositoryViews(r, query)
 	if err != nil {
-		s.renderUI(w, "repositories", uiPage{Title: "Repositories", Active: "repositories", SearchQuery: query, Error: "Failed to load repositories"})
+		s.renderUI(w, r, "repositories", uiPage{Title: "Repositories", Active: "repositories", SearchQuery: query, Error: "Failed to load repositories"})
 		return
 	}
-	s.renderUI(w, "repositories", uiPage{Title: "Repositories", Active: "repositories", Repos: repos, SearchQuery: query})
+	s.renderUI(w, r, "repositories", uiPage{Title: "Repositories", Active: "repositories", Repos: repos, SearchQuery: query})
 }
 
 func (s *Server) handleUIRepositoryTagDelete(w http.ResponseWriter, r *http.Request) {
@@ -423,7 +425,7 @@ func (s *Server) renderRepositoriesWithError(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		message = "Failed to load repositories"
 	}
-	s.renderUI(w, "repositories", uiPage{Title: "Repositories", Active: "repositories", Error: message, Repos: repos, SearchQuery: query})
+	s.renderUI(w, r, "repositories", uiPage{Title: "Repositories", Active: "repositories", Error: message, Repos: repos, SearchQuery: query})
 }
 
 func (s *Server) loadRepositoryViews(r *http.Request, query string) ([]repositoryView, error) {
@@ -474,10 +476,10 @@ func splitRepositoryName(repository string) (string, string) {
 func (s *Server) handleUIUsers(w http.ResponseWriter, r *http.Request) {
 	users, err := s.loadUserAccess(r)
 	if err != nil {
-		s.renderUI(w, "users", uiPage{Title: "Users", Active: "users", Error: "Failed to load users"})
+		s.renderUI(w, r, "users", uiPage{Title: "Users", Active: "users", Error: "Failed to load users"})
 		return
 	}
-	s.renderUI(w, "users", uiPage{Title: "Users", Active: "users", Users: users})
+	s.renderUI(w, r, "users", uiPage{Title: "Users", Active: "users", Users: users})
 }
 
 func (s *Server) handleUIUsersCreate(w http.ResponseWriter, r *http.Request) {
@@ -530,7 +532,7 @@ func (s *Server) handleUIUsersCreate(w http.ResponseWriter, r *http.Request) {
 		s.renderUsersWithError(w, r, "Failed to load users")
 		return
 	}
-	s.renderUI(w, "users", uiPage{
+	s.renderUI(w, r, "users", uiPage{
 		Title:  "Users",
 		Active: "users",
 		Users:  users,
@@ -645,7 +647,7 @@ func (s *Server) renderUsersWithError(w http.ResponseWriter, r *http.Request, me
 	if err != nil {
 		message = "Failed to load users"
 	}
-	s.renderUI(w, "users", uiPage{Title: "Users", Active: "users", Error: message, Users: users})
+	s.renderUI(w, r, "users", uiPage{Title: "Users", Active: "users", Error: message, Users: users})
 }
 
 func (s *Server) loadUserAccess(r *http.Request) ([]userAccessView, error) {
@@ -711,7 +713,7 @@ func (s *Server) handleUIAudit(w http.ResponseWriter, r *http.Request) {
 	actionFilter := strings.TrimSpace(r.URL.Query().Get("action"))
 	events, err := s.store.ListAuditEvents(r.Context(), 100)
 	if err != nil {
-		s.renderUI(w, "audit", uiPage{Title: "Audit", Active: "audit", SearchQuery: query, ActionFilter: actionFilter, Error: "Failed to load audit events"})
+		s.renderUI(w, r, "audit", uiPage{Title: "Audit", Active: "audit", SearchQuery: query, ActionFilter: actionFilter, Error: "Failed to load audit events"})
 		return
 	}
 	views := make([]auditEventView, 0, len(events))
@@ -726,21 +728,21 @@ func (s *Server) handleUIAudit(w http.ResponseWriter, r *http.Request) {
 		}
 		views = append(views, view)
 	}
-	s.renderUI(w, "audit", uiPage{Title: "Audit", Active: "audit", SearchQuery: query, ActionFilter: actionFilter, AuditEvents: views})
+	s.renderUI(w, r, "audit", uiPage{Title: "Audit", Active: "audit", SearchQuery: query, ActionFilter: actionFilter, AuditEvents: views})
 }
 
 func (s *Server) handleUISettings(w http.ResponseWriter, r *http.Request) {
 	settings, err := s.store.GCSettings(r.Context(), s.defaultGCSettings())
 	if err != nil {
-		s.renderUI(w, "settings", uiPage{Title: "Settings", Active: "settings", Error: "Failed to load settings"})
+		s.renderUI(w, r, "settings", uiPage{Title: "Settings", Active: "settings", Error: "Failed to load settings"})
 		return
 	}
 	webhook, err := s.store.RegistryWebhookSettings(r.Context())
 	if err != nil {
-		s.renderUI(w, "settings", uiPage{Title: "Settings", Active: "settings", GCSettings: settings, Error: "Failed to load webhook settings"})
+		s.renderUI(w, r, "settings", uiPage{Title: "Settings", Active: "settings", GCSettings: settings, Error: "Failed to load webhook settings"})
 		return
 	}
-	s.renderUI(w, "settings", uiPage{Title: "Settings", Active: "settings", GCSettings: settings, RegistryWebhook: webhook})
+	s.renderUI(w, r, "settings", uiPage{Title: "Settings", Active: "settings", GCSettings: settings, RegistryWebhook: webhook})
 }
 
 func (s *Server) handleUIGCSettingsUpdate(w http.ResponseWriter, r *http.Request) {
@@ -801,7 +803,7 @@ func (s *Server) renderSettingsWithError(w http.ResponseWriter, r *http.Request,
 	if err != nil {
 		webhook = domain.RegistryWebhookSettings{}
 	}
-	s.renderUI(w, "settings", uiPage{Title: "Settings", Active: "settings", Error: message, GCSettings: settings, RegistryWebhook: webhook})
+	s.renderUI(w, r, "settings", uiPage{Title: "Settings", Active: "settings", Error: message, GCSettings: settings, RegistryWebhook: webhook})
 }
 
 func (s *Server) defaultGCSettings() domain.GCSettings {
@@ -822,6 +824,9 @@ func validateRegistryWebhookURL(raw string) error {
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return fmt.Errorf("registry webhook URL must use http or https")
+	}
+	if ip := net.ParseIP(parsed.Hostname()); ip != nil && unsafeWebhookIP(ip) {
+		return fmt.Errorf("registry webhook URL must not target private or reserved addresses")
 	}
 	return nil
 }
@@ -920,7 +925,7 @@ func (s *Server) requireUIAdmin(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (s *Server) renderUI(w http.ResponseWriter, name string, page uiPage) {
+func (s *Server) renderUI(w http.ResponseWriter, r *http.Request, name string, page uiPage) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := uiTemplates.ExecuteTemplate(w, name, page); err != nil {
 		s.logger.Error("failed to render ui", "template", name, "error", err)
