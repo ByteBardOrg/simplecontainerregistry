@@ -1,0 +1,43 @@
+services:
+  registry:
+    image: bytebardorg/simplecontainerregistry:latest
+    restart: unless-stopped
+    stop_grace_period: 20s
+    environment:
+      SCR_BOOTSTRAP_ADMIN_USERNAME: "${SCR_BOOTSTRAP_ADMIN_USERNAME:-admin}"
+      SCR_BOOTSTRAP_ADMIN_PASSWORD: "${SCR_BOOTSTRAP_ADMIN_PASSWORD:?SCR_BOOTSTRAP_ADMIN_PASSWORD must be set}"
+    ports:
+      - "${SCR_BIND_ADDRESS:-127.0.0.1}:${SCR_PORT:-5000}:5000"
+    volumes:
+      - registry-data:/var/lib/scr
+    configs:
+      - source: registry-config
+        target: /etc/scr/config.yaml
+
+volumes:
+  registry-data:
+
+configs:
+  registry-config:
+    content: |
+      http:
+        address: "${SCR_HTTP_ADDRESS:-0.0.0.0}"
+        port: ${SCR_HTTP_PORT:-5000}
+        secureCookies: ${SCR_SECURE_COOKIES:-true}
+        publicURL: "${SCR_PUBLIC_URL:-}"
+        trustForwardedHeaders: ${SCR_TRUST_FORWARDED_HEADERS:-false}
+
+      storage:
+        rootDirectory: "${SCR_STORAGE_ROOT_DIRECTORY:-/var/lib/scr/registry}"
+        gc: ${SCR_STORAGE_GC:-true}
+        gcDelay: "${SCR_STORAGE_GC_DELAY:-1h}"
+        gcInterval: "${SCR_STORAGE_GC_INTERVAL:-24h}"
+
+      database:
+        driver: "sqlite"
+        dsn: "${SCR_DATABASE_DSN:-/var/lib/scr/scr.db}"
+
+      auth:
+        issuer: "${SCR_AUTH_ISSUER:-scr}"
+        service: "${SCR_AUTH_SERVICE:-scr}"
+        tokenTTL: "${SCR_AUTH_TOKEN_TTL:-10m}"
