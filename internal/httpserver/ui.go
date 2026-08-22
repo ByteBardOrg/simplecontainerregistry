@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -121,6 +122,7 @@ type uiPage struct {
 	Title            string
 	Active           string
 	Error            string
+	CSRFToken        string
 	IssuedUserSecret *issuedUserSecretView
 	Summary          domain.DashboardSummary
 	Traffic          []trafficDayView
@@ -196,12 +198,26 @@ func (s *Server) handleUILogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUILoginPost(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	if err := r.ParseForm(); err != nil {
 		s.renderUI(w, r, "login", uiPage{Title: "Sign In", Error: "Invalid form submission"})
 		return
 	}
+	username := r.FormValue("username")
+	if retryAfter, allowed := s.authLimits.allow(s.requestIP(r), username); !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(retryAfter.Round(time.Second).Seconds()))))
+		s.renderUIStatus(w, r, http.StatusTooManyRequests, "login", uiPage{Title: "Sign In", Error: "Too many authentication attempts. Try again later."})
+		return
+	}
+	release, acquired := s.authLimits.acquireVerification()
+	if !acquired {
+		w.Header().Set("Retry-After", "1")
+		s.renderUIStatus(w, r, http.StatusTooManyRequests, "login", uiPage{Title: "Sign In", Error: "Too many authentication attempts. Try again later."})
+		return
+	}
 	now := time.Now().UTC()
-	authenticated, err := s.users.Authenticate(r.Context(), r.FormValue("username"), r.FormValue("password"), now)
+	authenticated, err := s.users.Authenticate(r.Context(), username, r.FormValue("password"), now)
+	release()
 	if err != nil || authenticated.User.Role != domain.RoleAdmin {
 		if auditErr := s.auditAnonymous(r, "ui.login.denied", "username", r.FormValue("username"), "invalid_credentials"); auditErr != nil {
 			s.logger.Error("failed to write audit event", "error", auditErr)
@@ -926,7 +942,17 @@ func (s *Server) requireUIAdmin(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) renderUI(w http.ResponseWriter, r *http.Request, name string, page uiPage) {
+	s.renderUIStatus(w, r, http.StatusOK, name, page)
+}
+
+func (s *Server) renderUIStatus(w http.ResponseWriter, r *http.Request, status int, name string, page uiPage) {
+	if page.CSRFToken == "" {
+		if cookie, err := r.Cookie(adminCookieName); err == nil && cookie.Value != "" {
+			page.CSRFToken = csrfToken(cookie.Value)
+		}
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
 	if err := uiTemplates.ExecuteTemplate(w, name, page); err != nil {
 		s.logger.Error("failed to render ui", "template", name, "error", err)
 	}
@@ -1086,7 +1112,7 @@ const uiTemplateText = `
     @media (max-width: 800px) { .sidenav { position:static; width:auto; min-height:auto; border-right:0; border-bottom:1px solid var(--line); } .main-shell { margin-left:0; } .topbar { padding:0 16px; } .canvas { padding:16px; } .stat-grid { grid-template-columns:repeat(2, minmax(0, 1fr)); } .page-header { flex-direction:column; } .form-grid { grid-template-columns:1fr; min-width:0; } }
   </style>
 </head>
-<body>
+<body data-csrf-token="{{.CSRFToken}}">
   <nav class="sidenav">
     <div class="brand-block"><h1 class="brand-title">SCR</h1></div>
     <div class="nav-list">
@@ -1099,7 +1125,7 @@ const uiTemplateText = `
   </nav>
   <div class="main-shell">
     <header class="topbar">
-      <div class="shell-actions"><a class="icon-button" href="/v2/"><span class="material-symbols-outlined">dns</span>Registry API</a><form method="post" action="/ui/logout"><button class="logout" type="submit"><span class="material-symbols-outlined">logout</span>Sign out</button></form></div>
+      <div class="shell-actions"><a class="icon-button" href="/v2/"><span class="material-symbols-outlined">dns</span>Registry API</a><form method="post" action="/ui/logout"><input type="hidden" name="_csrf" value="{{.CSRFToken}}"><button class="logout" type="submit"><span class="material-symbols-outlined">logout</span>Sign out</button></form></div>
     </header>
     <main class="canvas">
       {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
@@ -1108,6 +1134,18 @@ const uiTemplateText = `
   </div>
   <div class="modal-backdrop" id="confirm-modal" aria-hidden="true"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><h2 id="confirm-title">Are you sure?</h2><p id="confirm-body">This action cannot be undone.</p><form id="confirm-form" method="post"><div id="confirm-fields"></div><div class="modal-actions"><button class="secondary-action" type="button" id="confirm-cancel">Cancel</button><button class="danger-action" type="submit" id="confirm-submit">Delete</button></div></form></div></div>
   <script>
+    (() => {
+      const token = document.body.dataset.csrfToken;
+      if (!token) return;
+      document.querySelectorAll('form[method="post"]').forEach((form) => {
+        if (form.elements.namedItem('_csrf')) return;
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = '_csrf';
+        input.value = token;
+        form.prepend(input);
+      });
+    })();
     (() => {
       const modal = document.getElementById('confirm-modal');
       const form = document.getElementById('confirm-form');

@@ -14,11 +14,13 @@ Registry content is stored on disk. Users, repository grants, repository metadat
 Start the registry with the published Docker image:
 
 ```bash
+export SCR_BOOTSTRAP_ADMIN_PASSWORD="$(openssl rand -base64 32)"
 docker run --rm --name scr \
-  -p 5000:5000 \
+  -p 127.0.0.1:5000:5000 \
   -v scr-data:/var/lib/scr \
   -e SCR_BOOTSTRAP_ADMIN_USERNAME=admin \
-  -e SCR_BOOTSTRAP_ADMIN_PASSWORD=change-me \
+  -e SCR_BOOTSTRAP_ADMIN_PASSWORD \
+  -e SCR_SECURE_COOKIES=false \
   bytebardorg/simplecontainerregistry:latest
 ```
 
@@ -35,14 +37,28 @@ Sign in with the bootstrap admin username and password. The bootstrap admin is c
 Log in with a Docker-compatible client and push an image:
 
 ```bash
-printf '%s\n' 'change-me' | docker login localhost:5000 -u admin --password-stdin
+printf '%s\n' "$SCR_BOOTSTRAP_ADMIN_PASSWORD" | docker login localhost:5000 -u admin --password-stdin
 docker pull busybox:latest
 docker tag busybox:latest localhost:5000/getting-started/busybox:latest
 docker push localhost:5000/getting-started/busybox:latest
 docker pull localhost:5000/getting-started/busybox:latest
 ```
 
-For non-local deployments, use a strong bootstrap password and run SCR behind TLS, usually through a reverse proxy.
+The direct local HTTP example explicitly disables secure cookies and binds only to loopback. For non-local deployments, keep secure cookies enabled and run SCR behind TLS, usually through a reverse proxy.
+
+### Deploy with Dokploy
+
+Create a Docker Compose service in Dokploy from this repository and set the Compose path to `compose.yaml`. Add these environment variables in Dokploy before deploying:
+
+```dotenv
+SCR_PUBLIC_URL=https://registry.example.com
+SCR_BOOTSTRAP_ADMIN_USERNAME=admin
+SCR_BOOTSTRAP_ADMIN_PASSWORD=replace-with-a-strong-password
+```
+
+In the Dokploy **Domains** tab, add the hostname from `SCR_PUBLIC_URL`, select the `registry` service, set the container port to `5000`, and enable HTTPS. The public URL must be the origin only, without a trailing slash or path.
+
+The Compose deployment builds the image from this repository and stores the SQLite database and registry content in the `registry-data` named volume. For monitoring, configure Dokploy to request `GET /healthz` on port `5000`.
 
 ## Configuration
 

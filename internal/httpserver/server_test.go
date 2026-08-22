@@ -210,6 +210,34 @@ func TestRegistryBlobManifestAndTagsFlow(t *testing.T) {
 	createHTTPTestUser(t, ctx, store, "admin", "Admin", domain.RoleAdmin, "admin-secret", now)
 	adminToken := requestToken(t, handler, "admin", "admin-secret", "")
 	adminDeleteToken := requestToken(t, handler, "admin", "admin-secret", "repository:team-a/app:delete")
+	adminTeamAPushToken := requestToken(t, handler, "admin", "admin-secret", "repository:team-a/app:push")
+	otherRepositoryToken := requestToken(t, handler, "admin", "admin-secret", "repository:team-b/app:pull,push,delete")
+
+	crossRepositoryRead := authenticatedRequest(handler, http.MethodGet, "/v2/team-b/app/blobs/"+digest, otherRepositoryToken, nil)
+	if crossRepositoryRead.Code != http.StatusNotFound {
+		t.Fatalf("expected blob to be isolated from another authorized repository, got %d: %s", crossRepositoryRead.Code, crossRepositoryRead.Body.String())
+	}
+	crossRepositoryDelete := authenticatedRequest(handler, http.MethodDelete, "/v2/team-b/app/blobs/"+digest, otherRepositoryToken, nil)
+	if crossRepositoryDelete.Code != http.StatusNotFound {
+		t.Fatalf("expected cross-repository blob delete to be rejected, got %d: %s", crossRepositoryDelete.Code, crossRepositoryDelete.Body.String())
+	}
+	originalBlob := authenticatedRequest(handler, http.MethodGet, "/v2/team-a/app/blobs/"+digest, token, nil)
+	if originalBlob.Code != http.StatusOK || originalBlob.Body.String() != string(blob) {
+		t.Fatalf("expected original repository blob to remain available, got %d: %s", originalBlob.Code, originalBlob.Body.String())
+	}
+	boundUpload := authenticatedRequest(handler, http.MethodPost, "/v2/team-a/app/blobs/uploads/", token, nil)
+	if boundUpload.Code != http.StatusAccepted {
+		t.Fatalf("expected repository-bound upload start 202, got %d: %s", boundUpload.Code, boundUpload.Body.String())
+	}
+	crossUserUpload := authenticatedRequest(handler, http.MethodGet, boundUpload.Header().Get("Location"), adminTeamAPushToken, nil)
+	if crossUserUpload.Code != http.StatusNotFound {
+		t.Fatalf("expected upload UUID to be isolated from another user, got %d: %s", crossUserUpload.Code, crossUserUpload.Body.String())
+	}
+	crossRepositoryUploadPath := strings.Replace(boundUpload.Header().Get("Location"), "/team-a/app/", "/team-b/app/", 1)
+	crossRepositoryUpload := authenticatedRequest(handler, http.MethodGet, crossRepositoryUploadPath, otherRepositoryToken, nil)
+	if crossRepositoryUpload.Code != http.StatusNotFound {
+		t.Fatalf("expected upload UUID to be isolated from another repository, got %d: %s", crossRepositoryUpload.Code, crossRepositoryUpload.Body.String())
+	}
 
 	repositories := authenticatedRequest(handler, http.MethodGet, "/api/repositories", adminToken, nil)
 	if repositories.Code != http.StatusOK {
@@ -435,6 +463,10 @@ func TestOCIConformanceProtocolEdges(t *testing.T) {
 	if missingBlob.Code != http.StatusNotFound {
 		t.Fatalf("expected deleted blob HEAD 404, got %d", missingBlob.Code)
 	}
+	restoreBlob := authenticatedRequest(handler, http.MethodPost, "/v2/edge/app/blobs/uploads/?digest="+blobDigest, token, bytes.NewReader(blob))
+	if restoreBlob.Code != http.StatusCreated {
+		t.Fatalf("expected blob re-upload after repository unlink 201, got %d: %s", restoreBlob.Code, restoreBlob.Body.String())
+	}
 
 	start := authenticatedRequest(handler, http.MethodPost, "/v2/edge/app/blobs/uploads/", token, nil)
 	if start.Code != http.StatusAccepted {
@@ -461,7 +493,7 @@ func TestOCIConformanceProtocolEdges(t *testing.T) {
 		t.Fatalf("expected out-of-order final upload 416, got %d: %s", outOfOrderPut.Code, outOfOrderPut.Body.String())
 	}
 
-	manifest := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[]}`)
+	manifest := []byte(fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[]}`, blobDigest, len(blob)))
 	manifestDigest := sha512Digest(manifest)
 	putManifest := httptest.NewRecorder()
 	putManifestRequest := httptest.NewRequest(http.MethodPut, "/v2/edge/app/manifests/"+manifestDigest+"?tag=image", bytes.NewReader(manifest))
@@ -497,7 +529,7 @@ func TestOCIConformanceProtocolEdges(t *testing.T) {
 		t.Fatalf("expected subject manifest push 201, got %d: %s", putSubject.Code, putSubject.Body.String())
 	}
 	subjectDigest := putSubject.Header().Get("Docker-Content-Digest")
-	artifact := []byte(fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/vnd.example.test","config":{"mediaType":"application/vnd.example.config","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[],"subject":{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":%d}}`, subjectDigest, len(subjectManifest)))
+	artifact := []byte(fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/vnd.example.test","config":{"mediaType":"application/vnd.example.config","digest":"%s","size":%d},"layers":[],"subject":{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"%s","size":%d}}`, blobDigest, len(blob), subjectDigest, len(subjectManifest)))
 	artifactDigest := sha256Digest(artifact)
 	putArtifact := httptest.NewRecorder()
 	putArtifactRequest := httptest.NewRequest(http.MethodPut, "/v2/edge/app/manifests/"+artifactDigest, bytes.NewReader(artifact))
@@ -589,6 +621,14 @@ func TestUILoginAndDashboard(t *testing.T) {
 	}
 	logoutRequest := httptest.NewRequest(http.MethodPost, "/ui/logout", nil)
 	logoutRequest.AddCookie(sessionCookie)
+	missingCSRFResponse := httptest.NewRecorder()
+	handler.ServeHTTP(missingCSRFResponse, logoutRequest)
+	if missingCSRFResponse.Code != http.StatusForbidden {
+		t.Fatalf("expected logout without CSRF token to be rejected, got %d", missingCSRFResponse.Code)
+	}
+	logoutRequest = httptest.NewRequest(http.MethodPost, "/ui/logout", nil)
+	logoutRequest.AddCookie(sessionCookie)
+	addUICSRF(logoutRequest, sessionCookie)
 	logoutResponse := httptest.NewRecorder()
 	handler.ServeHTTP(logoutResponse, logoutRequest)
 	if logoutResponse.Code != http.StatusFound {
@@ -642,6 +682,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	settingsUpdateRequest := httptest.NewRequest(http.MethodPost, "/ui/settings/gc", strings.NewReader(settingsForm.Encode()))
 	settingsUpdateRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	settingsUpdateRequest.AddCookie(sessionCookie)
+	addUICSRF(settingsUpdateRequest, sessionCookie)
 	settingsUpdateResponse := httptest.NewRecorder()
 	handler.ServeHTTP(settingsUpdateResponse, settingsUpdateRequest)
 	if settingsUpdateResponse.Code != http.StatusFound {
@@ -659,6 +700,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	webhookUpdateRequest := httptest.NewRequest(http.MethodPost, "/ui/settings/webhook", strings.NewReader(webhookForm.Encode()))
 	webhookUpdateRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	webhookUpdateRequest.AddCookie(sessionCookie)
+	addUICSRF(webhookUpdateRequest, sessionCookie)
 	webhookUpdateResponse := httptest.NewRecorder()
 	handler.ServeHTTP(webhookUpdateResponse, webhookUpdateRequest)
 	if webhookUpdateResponse.Code != http.StatusFound {
@@ -752,6 +794,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	deleteTagRequest := httptest.NewRequest(http.MethodPost, "/ui/repositories/delete-tag", strings.NewReader(deleteTagForm.Encode()))
 	deleteTagRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	deleteTagRequest.AddCookie(sessionCookie)
+	addUICSRF(deleteTagRequest, sessionCookie)
 	deleteTagResponse := httptest.NewRecorder()
 	handler.ServeHTTP(deleteTagResponse, deleteTagRequest)
 	if deleteTagResponse.Code != http.StatusFound {
@@ -771,6 +814,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	deleteRepositoryRequest := httptest.NewRequest(http.MethodPost, "/ui/repositories/delete", strings.NewReader(deleteRepositoryForm.Encode()))
 	deleteRepositoryRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	deleteRepositoryRequest.AddCookie(sessionCookie)
+	addUICSRF(deleteRepositoryRequest, sessionCookie)
 	deleteRepositoryResponse := httptest.NewRecorder()
 	handler.ServeHTTP(deleteRepositoryResponse, deleteRepositoryRequest)
 	if deleteRepositoryResponse.Code != http.StatusFound {
@@ -789,6 +833,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	createUserRequest := httptest.NewRequest(http.MethodPost, "/ui/users", strings.NewReader(createUserForm.Encode()))
 	createUserRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	createUserRequest.AddCookie(sessionCookie)
+	addUICSRF(createUserRequest, sessionCookie)
 	createUserResponse := httptest.NewRecorder()
 	handler.ServeHTTP(createUserResponse, createUserRequest)
 	if createUserResponse.Code != http.StatusOK {
@@ -849,6 +894,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	validityRequest := httptest.NewRequest(http.MethodPost, "/ui/users/"+createdUser.ID+"/access", strings.NewReader(validityForm.Encode()))
 	validityRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	validityRequest.AddCookie(sessionCookie)
+	addUICSRF(validityRequest, sessionCookie)
 	validityResponse := httptest.NewRecorder()
 	handler.ServeHTTP(validityResponse, validityRequest)
 	if validityResponse.Code != http.StatusFound {
@@ -875,6 +921,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	adminValidityRequest := httptest.NewRequest(http.MethodPost, "/ui/users/"+adminUser.ID+"/access", strings.NewReader(validityForm.Encode()))
 	adminValidityRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	adminValidityRequest.AddCookie(sessionCookie)
+	addUICSRF(adminValidityRequest, sessionCookie)
 	adminValidityResponse := httptest.NewRecorder()
 	handler.ServeHTTP(adminValidityResponse, adminValidityRequest)
 	if adminValidityResponse.Code != http.StatusOK || !strings.Contains(adminValidityResponse.Body.String(), "Admin users are managed outside this user list") {
@@ -884,6 +931,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 	deleteUser := createHTTPTestUser(t, ctx, store, "delete-me", "Delete Me", domain.RoleReader, "delete-secret", time.Now().UTC())
 	deleteRequest := httptest.NewRequest(http.MethodPost, "/ui/users/"+deleteUser.ID+"/delete", nil)
 	deleteRequest.AddCookie(sessionCookie)
+	addUICSRF(deleteRequest, sessionCookie)
 	deleteResponse := httptest.NewRecorder()
 	handler.ServeHTTP(deleteResponse, deleteRequest)
 	if deleteResponse.Code != http.StatusFound {
@@ -1028,6 +1076,7 @@ func TestRegistryWebhookReceivesRegistryAndUIDeleteEvents(t *testing.T) {
 	deleteRequest := httptest.NewRequest(http.MethodPost, "/ui/repositories/delete", strings.NewReader(deleteForm.Encode()))
 	deleteRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	deleteRequest.AddCookie(loginResponse.Result().Cookies()[0])
+	addUICSRF(deleteRequest, loginResponse.Result().Cookies()[0])
 	deleteResponse := httptest.NewRecorder()
 	handler.ServeHTTP(deleteResponse, deleteRequest)
 	if deleteResponse.Code != http.StatusFound {
@@ -1258,6 +1307,10 @@ func authenticatedRequest(handler http.Handler, method, path, token string, body
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response
+}
+
+func addUICSRF(request *http.Request, sessionCookie *http.Cookie) {
+	request.Header.Set("X-CSRF-Token", csrfToken(sessionCookie.Value))
 }
 
 func waitForWebhookEvent(t *testing.T, events <-chan registryWebhookPayload, event string) registryWebhookPayload {

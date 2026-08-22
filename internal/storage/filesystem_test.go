@@ -110,6 +110,63 @@ func TestCommitBlobFromUploadSupportsSHA512(t *testing.T) {
 	}
 }
 
+func TestRepositoryBlobLinksAreIsolated(t *testing.T) {
+	fs, err := NewFilesystem(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFilesystem() error = %v", err)
+	}
+	content := []byte("private layer")
+	digest := sha256DigestForTest(content)
+	uploadPath := filepath.Join(t.TempDir(), "upload")
+	if err := os.WriteFile(uploadPath, content, 0o640); err != nil {
+		t.Fatalf("WriteFile(upload) error = %v", err)
+	}
+	if _, err := fs.CommitBlobFromUpload(uploadPath, digest); err != nil {
+		t.Fatalf("CommitBlobFromUpload() error = %v", err)
+	}
+	if err := fs.LinkRepositoryBlob("team-a/app", digest); err != nil {
+		t.Fatalf("LinkRepositoryBlob() error = %v", err)
+	}
+	if linked, err := fs.HasRepositoryBlob("team-a/app", digest); err != nil || !linked {
+		t.Fatalf("expected blob linked to team-a/app, linked=%v err=%v", linked, err)
+	}
+	if linked, err := fs.HasRepositoryBlob("team-b/app", digest); err != nil || linked {
+		t.Fatalf("expected blob isolated from team-b/app, linked=%v err=%v", linked, err)
+	}
+	if err := fs.DeleteRepositoryBlob("team-a/app", digest); err != nil {
+		t.Fatalf("DeleteRepositoryBlob() error = %v", err)
+	}
+	if exists, _, err := fs.HasBlob(digest); err != nil || !exists {
+		t.Fatalf("expected shared blob content to survive repository unlink, exists=%v err=%v", exists, err)
+	}
+}
+
+func TestMigrateRepositoryBlobLinksPreservesExistingManifestBlobs(t *testing.T) {
+	fs, err := NewFilesystem(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFilesystem() error = %v", err)
+	}
+	content := []byte("existing layer")
+	digest := sha256DigestForTest(content)
+	uploadPath := filepath.Join(t.TempDir(), "upload")
+	if err := os.WriteFile(uploadPath, content, 0o640); err != nil {
+		t.Fatalf("WriteFile(upload) error = %v", err)
+	}
+	if _, err := fs.CommitBlobFromUpload(uploadPath, digest); err != nil {
+		t.Fatalf("CommitBlobFromUpload() error = %v", err)
+	}
+	manifest := []byte(`{"schemaVersion":2,"config":{"digest":"` + digest + `"},"layers":[]}`)
+	if _, _, err := fs.PutManifest("legacy/app", "latest", "application/vnd.oci.image.manifest.v1+json", manifest); err != nil {
+		t.Fatalf("PutManifest() error = %v", err)
+	}
+	if err := fs.MigrateRepositoryBlobLinks(); err != nil {
+		t.Fatalf("MigrateRepositoryBlobLinks() error = %v", err)
+	}
+	if linked, err := fs.HasRepositoryBlob("legacy/app", digest); err != nil || !linked {
+		t.Fatalf("expected migration to link existing manifest blob, linked=%v err=%v", linked, err)
+	}
+}
+
 func TestFilesystemRejectsUnsafeTagReferences(t *testing.T) {
 	fs, err := NewFilesystem(t.TempDir())
 	if err != nil {

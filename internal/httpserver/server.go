@@ -37,12 +37,16 @@ type Server struct {
 	tokens     auth.TokenService
 	registryFS storage.Filesystem
 	webhooks   *registryWebhookDispatcher
+	authLimits *authAttemptLimiter
 	mux        *http.ServeMux
 }
 
 func New(opts Options) http.Handler {
 	registryFS, err := storage.NewFilesystem(opts.Config.Storage.RootDirectory)
 	if err != nil {
+		panic(err)
+	}
+	if err := registryFS.MigrateRepositoryBlobLinks(); err != nil {
 		panic(err)
 	}
 	logger := opts.Logger
@@ -57,6 +61,7 @@ func New(opts Options) http.Handler {
 		tokens:     auth.NewTokenService(opts.Store, opts.Config.Auth),
 		registryFS: registryFS,
 		webhooks:   newRegistryWebhookDispatcher(opts.Store, logger),
+		authLimits: newAuthAttemptLimiter(),
 		mux:        http.NewServeMux(),
 	}
 	server.routes()
@@ -72,20 +77,20 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /{$}", s.handleUIRoot)
 	s.mux.HandleFunc("GET /ui/login", s.handleUILogin)
 	s.mux.HandleFunc("POST /ui/login", s.handleUILoginPost)
-	s.mux.HandleFunc("POST /ui/logout", s.handleUILogout)
+	s.mux.HandleFunc("POST /ui/logout", s.requireUIAdminMutation(s.handleUILogout))
 	s.mux.HandleFunc("GET /ui/{$}", s.handleUITrailingSlash)
 	s.mux.HandleFunc("GET /ui", s.requireUIAdmin(s.handleUIDashboard))
 	s.mux.HandleFunc("GET /ui/repositories", s.requireUIAdmin(s.handleUIRepositories))
-	s.mux.HandleFunc("POST /ui/repositories/delete", s.requireUIAdmin(s.handleUIRepositoryDelete))
-	s.mux.HandleFunc("POST /ui/repositories/delete-tag", s.requireUIAdmin(s.handleUIRepositoryTagDelete))
+	s.mux.HandleFunc("POST /ui/repositories/delete", s.requireUIAdminMutation(s.handleUIRepositoryDelete))
+	s.mux.HandleFunc("POST /ui/repositories/delete-tag", s.requireUIAdminMutation(s.handleUIRepositoryTagDelete))
 	s.mux.HandleFunc("GET /ui/users", s.requireUIAdmin(s.handleUIUsers))
-	s.mux.HandleFunc("POST /ui/users", s.requireUIAdmin(s.handleUIUsersCreate))
-	s.mux.HandleFunc("POST /ui/users/{id}/access", s.requireUIAdmin(s.handleUIUserAccessUpdate))
-	s.mux.HandleFunc("POST /ui/users/{id}/delete", s.requireUIAdmin(s.handleUIUserDelete))
+	s.mux.HandleFunc("POST /ui/users", s.requireUIAdminMutation(s.handleUIUsersCreate))
+	s.mux.HandleFunc("POST /ui/users/{id}/access", s.requireUIAdminMutation(s.handleUIUserAccessUpdate))
+	s.mux.HandleFunc("POST /ui/users/{id}/delete", s.requireUIAdminMutation(s.handleUIUserDelete))
 	s.mux.HandleFunc("GET /ui/audit", s.requireUIAdmin(s.handleUIAudit))
 	s.mux.HandleFunc("GET /ui/settings", s.requireUIAdmin(s.handleUISettings))
-	s.mux.HandleFunc("POST /ui/settings/gc", s.requireUIAdmin(s.handleUIGCSettingsUpdate))
-	s.mux.HandleFunc("POST /ui/settings/webhook", s.requireUIAdmin(s.handleUIRegistryWebhookSettingsUpdate))
+	s.mux.HandleFunc("POST /ui/settings/gc", s.requireUIAdminMutation(s.handleUIGCSettingsUpdate))
+	s.mux.HandleFunc("POST /ui/settings/webhook", s.requireUIAdminMutation(s.handleUIRegistryWebhookSettingsUpdate))
 
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux.HandleFunc("GET /token", s.handleToken)
@@ -115,10 +120,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	username, secret, ok := r.BasicAuth()
+	if retryAfter, allowed := s.authLimits.allow(s.requestIP(r), username); !allowed {
+		writeAuthRateLimited(w, retryAfter)
+		return
+	}
 	if !ok {
-		if err := s.auditAnonymous(r, "token.denied", "user", "", "missing_basic_auth"); err != nil {
-			s.logger.Error("failed to write audit event", "error", err)
-		}
 		w.Header().Set("WWW-Authenticate", `Basic realm="scr token service"`)
 		writeError(w, http.StatusUnauthorized, "basic authentication is required")
 		return
@@ -126,14 +132,17 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 
 	requested, err := parseRequestedScopes(r.URL.Query()["scope"])
 	if err != nil {
-		if auditErr := s.auditAnonymous(r, "token.denied", "username", username, "invalid_scope"); auditErr != nil {
-			s.logger.Error("failed to write audit event", "error", auditErr)
-		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
+	release, acquired := s.authLimits.acquireVerification()
+	if !acquired {
+		writeAuthRateLimited(w, time.Second)
+		return
+	}
 	authenticated, err := s.users.Authenticate(r.Context(), username, secret, now)
+	release()
 	if err != nil {
 		status := http.StatusInternalServerError
 		result := "error"
@@ -285,6 +294,15 @@ func (s *Server) serveRegistryRoute(w http.ResponseWriter, r *http.Request, rout
 }
 
 func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request, route registryRoute) {
+	linked, err := s.registryFS.HasRepositoryBlob(route.repository, route.reference)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !linked {
+		writeError(w, http.StatusNotFound, "blob not found")
+		return
+	}
 	exists, _, err := s.registryFS.HasBlob(route.reference)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -295,7 +313,7 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request, route regist
 		return
 	}
 	if r.Method == http.MethodDelete {
-		if err := s.registryFS.DeleteBlob(route.reference); err != nil {
+		if err := s.registryFS.DeleteRepositoryBlob(route.repository, route.reference); err != nil {
 			writeStorageError(w, err)
 			return
 		}
@@ -347,7 +365,12 @@ func (s *Server) handleUploadStart(w http.ResponseWriter, r *http.Request, route
 		writeError(w, http.StatusInternalServerError, "failed to create upload")
 		return
 	}
-	uploadPath, err := s.registryFS.UploadPath(uploadID)
+	principal, ok := principalFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	uploadPath, err := s.registryFS.UploadPath(route.repository, principal.UserID, uploadID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create upload")
 		return
@@ -376,7 +399,12 @@ func (s *Server) handleUploadStart(w http.ResponseWriter, r *http.Request, route
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, route registryRoute) {
-	uploadPath, err := s.registryFS.UploadPath(route.uploadID)
+	principal, ok := principalFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	uploadPath, err := s.registryFS.UploadPath(route.repository, principal.UserID, route.uploadID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -439,6 +467,10 @@ func (s *Server) commitBlobUpload(w http.ResponseWriter, r *http.Request, reposi
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := s.registryFS.LinkRepositoryBlob(repository, digest); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to link blob to repository")
+		return
+	}
 	if err := s.store.IncrementUsageCounter(r.Context(), repository, domain.ActionPush, time.Now().UTC()); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update usage counters")
 		return
@@ -490,6 +522,17 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request, route re
 		mediaType := r.Header.Get("Content-Type")
 		if mediaType == "" {
 			mediaType = "application/vnd.oci.image.manifest.v1+json"
+		}
+		for _, digest := range storage.ManifestBlobDigests(content) {
+			linked, err := s.registryFS.HasRepositoryBlob(route.repository, digest)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			if !linked {
+				writeError(w, http.StatusBadRequest, "manifest references a blob that is not available to this repository")
+				return
+			}
 		}
 		digest, _, err := s.registryFS.PutManifest(route.repository, route.reference, mediaType, content)
 		if err != nil {

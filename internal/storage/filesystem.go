@@ -64,6 +64,18 @@ func (fs Filesystem) BlobPath(digest string) (string, error) {
 	return fs.safeJoin("blobs", algorithm, encoded[:2], encoded), nil
 }
 
+func (fs Filesystem) RepositoryBlobPath(repository, digest string) (string, error) {
+	repoPath, err := safeRepositoryPath(repository)
+	if err != nil {
+		return "", err
+	}
+	algorithm, encoded, err := parseDigest(digest)
+	if err != nil {
+		return "", err
+	}
+	return fs.safeJoin("repositories", repoPath, "blobs", algorithm, encoded), nil
+}
+
 func (fs Filesystem) ManifestPath(repository, reference string) (string, error) {
 	repoPath, err := safeRepositoryPath(repository)
 	if err != nil {
@@ -223,8 +235,8 @@ func (fs Filesystem) DeleteManifest(repository, reference string) (string, error
 	return digest, nil
 }
 
-func (fs Filesystem) DeleteBlob(digest string) error {
-	path, err := fs.BlobPath(digest)
+func (fs Filesystem) DeleteRepositoryBlob(repository, digest string) error {
+	path, err := fs.RepositoryBlobPath(repository, digest)
 	if err != nil {
 		return err
 	}
@@ -235,6 +247,97 @@ func (fs Filesystem) DeleteBlob(digest string) error {
 		return err
 	}
 	return nil
+}
+
+func (fs Filesystem) LinkRepositoryBlob(repository, digest string) error {
+	exists, _, err := fs.HasBlob(digest)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNotFound
+	}
+	path, err := fs.RepositoryBlobPath(repository, digest)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil
+		}
+		return err
+	}
+	return file.Close()
+}
+
+func (fs Filesystem) HasRepositoryBlob(repository, digest string) (bool, error) {
+	path, err := fs.RepositoryBlobPath(repository, digest)
+	if err != nil {
+		return false, err
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (fs Filesystem) MigrateRepositoryBlobLinks() error {
+	marker := fs.safeJoin(".repository-blob-links-migrated")
+	if _, err := os.Stat(marker); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(fs.root, 0o750); err != nil {
+		return err
+	}
+	repositoriesRoot := fs.safeJoin("repositories")
+	if err := filepath.WalkDir(repositoriesRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.IsDir() || entry.Name() != "content" {
+			return nil
+		}
+		relative, err := filepath.Rel(repositoriesRoot, path)
+		if err != nil {
+			return err
+		}
+		marker := string(filepath.Separator) + "manifests" + string(filepath.Separator)
+		repository, _, ok := strings.Cut(relative, marker)
+		if !ok || repository == "" {
+			return nil
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, digest := range ManifestBlobDigests(content) {
+			exists, _, err := fs.HasBlob(digest)
+			if err != nil {
+				return err
+			}
+			if exists {
+				if err := fs.LinkRepositoryBlob(filepath.ToSlash(repository), digest); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.WriteFile(marker, nil, 0o640)
 }
 
 func (fs Filesystem) ListTags(repository string) ([]string, error) {
@@ -317,11 +420,18 @@ func (fs Filesystem) ListReferrers(repository, subjectDigest, artifactType strin
 	return descriptors, nil
 }
 
-func (fs Filesystem) UploadPath(uploadID string) (string, error) {
+func (fs Filesystem) UploadPath(repository, ownerID, uploadID string) (string, error) {
 	if uploadID == "" || strings.Contains(uploadID, "/") || strings.Contains(uploadID, "..") {
 		return "", fmt.Errorf("invalid upload id")
 	}
-	return fs.safeJoin("uploads", uploadID), nil
+	if ownerID == "" || strings.Contains(ownerID, "/") || strings.Contains(ownerID, "..") {
+		return "", fmt.Errorf("invalid upload owner")
+	}
+	repoPath, err := safeRepositoryPath(repository)
+	if err != nil {
+		return "", err
+	}
+	return fs.safeJoin("uploads", repoPath, ownerID, uploadID), nil
 }
 
 func (fs Filesystem) HasBlob(digest string) (bool, int64, error) {
@@ -608,6 +718,29 @@ func SubjectDigest(content []byte) string {
 		return ""
 	}
 	return manifest.Subject.Digest
+}
+
+func ManifestBlobDigests(content []byte) []string {
+	var manifest struct {
+		Config *Descriptor  `json:"config"`
+		Layers []Descriptor `json:"layers"`
+	}
+	if err := json.Unmarshal(content, &manifest); err != nil {
+		return nil
+	}
+	digests := make([]string, 0, 1+len(manifest.Layers))
+	seen := make(map[string]bool)
+	if manifest.Config != nil && manifest.Config.Digest != "" {
+		digests = append(digests, manifest.Config.Digest)
+		seen[manifest.Config.Digest] = true
+	}
+	for _, layer := range manifest.Layers {
+		if layer.Digest != "" && !seen[layer.Digest] {
+			digests = append(digests, layer.Digest)
+			seen[layer.Digest] = true
+		}
+	}
+	return digests
 }
 
 func manifestDigestAlgorithm(content []byte) string {
