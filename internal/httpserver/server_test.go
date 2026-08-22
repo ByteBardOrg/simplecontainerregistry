@@ -545,6 +545,28 @@ func TestUILoginAndDashboard(t *testing.T) {
 	}
 	handler := New(Options{Config: cfg, Store: store})
 
+	loginPageRequest := httptest.NewRequest(http.MethodGet, "/ui/login", nil)
+	loginPageResponse := httptest.NewRecorder()
+	handler.ServeHTTP(loginPageResponse, loginPageRequest)
+	if loginPageResponse.Code != http.StatusOK {
+		t.Fatalf("expected login page 200, got %d: %s", loginPageResponse.Code, loginPageResponse.Body.String())
+	}
+	if contentType := loginPageResponse.Header().Get("Content-Type"); contentType != "text/html; charset=utf-8" {
+		t.Fatalf("expected login page HTML content type, got %q", contentType)
+	}
+	loginPageHTML := loginPageResponse.Body.String()
+	for _, markup := range []string{
+		`<form class="login" method="post" action="/ui/login" autocomplete="on">`,
+		`<label for="username">Username</label>`,
+		`<input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>`,
+		`<label for="password">Password</label>`,
+		`<input id="password" name="password" type="password" autocomplete="current-password" required>`,
+	} {
+		if !strings.Contains(loginPageHTML, markup) {
+			t.Errorf("expected login page to contain %q", markup)
+		}
+	}
+
 	loginForm := url.Values{}
 	loginForm.Set("username", "admin")
 	loginForm.Set("password", "secret")

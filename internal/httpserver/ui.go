@@ -1233,7 +1233,7 @@ const uiTemplateText = `
 {{define "login"}}
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign In - SCR</title><link href="https://fonts.googleapis.com/css2?family=Geist:wght@500;600;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet"><style>{{template "login-css"}}</style></head>
-<body class="login-page"><form class="login" method="post" action="/ui/login"><h1>SCR</h1><p class="muted">Sign in as an admin user.</p>{{if .Error}}<div class="error">{{.Error}}</div>{{end}}<label for="username">Username</label><input id="username" name="username" autocomplete="username" required autofocus><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required><button class="primary-action" type="submit">Sign in</button></form></body></html>
+<body class="login-page"><form class="login" method="post" action="/ui/login" autocomplete="on"><h1>SCR</h1><p class="muted">Sign in as an admin user.</p>{{if .Error}}<div class="error">{{.Error}}</div>{{end}}<label for="username">Username</label><input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required><button class="primary-action" type="submit">Sign in</button></form></body></html>
 {{end}}
 
 {{define "login-css"}}
