@@ -381,10 +381,14 @@ func (s *Store) MarkRepositoryPulled(ctx context.Context, repositoryName, refere
 		return err
 	}
 
-	if reference != "" && !strings.Contains(reference, ":") {
+	if reference != "" {
+		matchColumn := "tag"
+		if strings.Contains(reference, ":") {
+			matchColumn = "digest"
+		}
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE repository_tags SET pulled_at = ?
-			WHERE repository_name = ? AND tag = ?`,
+			WHERE repository_name = ? AND `+matchColumn+` = ?`,
 			now, repositoryName, reference,
 		); err != nil {
 			return err

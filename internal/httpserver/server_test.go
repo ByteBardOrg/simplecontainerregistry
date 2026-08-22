@@ -719,6 +719,7 @@ func TestUILoginAndDashboard(t *testing.T) {
 
 	adminRegistryToken := requestToken(t, handler, "admin", "secret", "repository:ui/app:pull,push,delete")
 	uiManifest := []byte(`{"schemaVersion":2}`)
+	var uiManifestDigest string
 	for _, tag := range []string{"latest", "stable"} {
 		putManifest := httptest.NewRecorder()
 		putRequest := httptest.NewRequest(http.MethodPut, "/v2/ui/app/manifests/"+tag, bytes.NewReader(uiManifest))
@@ -728,6 +729,22 @@ func TestUILoginAndDashboard(t *testing.T) {
 		if putManifest.Code != http.StatusCreated {
 			t.Fatalf("expected UI fixture manifest push 201, got %d: %s", putManifest.Code, putManifest.Body.String())
 		}
+		uiManifestDigest = putManifest.Header().Get("Docker-Content-Digest")
+	}
+	resolveManifest := authenticatedRequest(handler, http.MethodHead, "/v2/ui/app/manifests/latest", adminRegistryToken, nil)
+	if resolveManifest.Code != http.StatusOK {
+		t.Fatalf("expected UI fixture manifest resolve 200, got %d: %s", resolveManifest.Code, resolveManifest.Body.String())
+	}
+	pullManifest := authenticatedRequest(handler, http.MethodGet, "/v2/ui/app/manifests/"+uiManifestDigest, adminRegistryToken, nil)
+	if pullManifest.Code != http.StatusOK {
+		t.Fatalf("expected UI fixture manifest pull 200, got %d: %s", pullManifest.Code, pullManifest.Body.String())
+	}
+	uiTags, err := store.ListRepositoryTags(ctx, "ui/app")
+	if err != nil {
+		t.Fatalf("ListRepositoryTags(ui/app) error = %v", err)
+	}
+	if len(uiTags) != 2 || uiTags[0].PulledAt == nil || uiTags[1].PulledAt == nil {
+		t.Fatalf("expected digest pull to update UI tag timestamps, got %#v", uiTags)
 	}
 	trafficRequest := httptest.NewRequest(http.MethodGet, "/ui?repository="+url.QueryEscape("ui/app"), nil)
 	trafficRequest.AddCookie(sessionCookie)
@@ -760,6 +777,10 @@ func TestUILoginAndDashboard(t *testing.T) {
 	}
 	if !strings.Contains(repositoriesResponse.Body.String(), "Digest") || !strings.Contains(repositoriesResponse.Body.String(), "Media Type") || !strings.Contains(repositoriesResponse.Body.String(), "Pushed") {
 		t.Fatalf("expected tag metadata table, got %s", repositoriesResponse.Body.String())
+	}
+	pulledAt := uiTags[0].PulledAt.UTC().Format("2006-01-02 15:04:05 UTC")
+	if !strings.Contains(repositoriesResponse.Body.String(), pulledAt) {
+		t.Fatalf("expected repositories UI to show pulled timestamp %q, got %s", pulledAt, repositoriesResponse.Body.String())
 	}
 	if strings.Index(repositoriesResponse.Body.String(), "stable") > strings.Index(repositoriesResponse.Body.String(), "latest") {
 		t.Fatalf("expected newest pushed tag to render before older tag, got %s", repositoriesResponse.Body.String())

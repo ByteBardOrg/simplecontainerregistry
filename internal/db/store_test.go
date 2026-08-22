@@ -65,6 +65,9 @@ func TestStoreRepositoryReadModelFlow(t *testing.T) {
 	if err := store.MarkRepositoryPulled(ctx, "team-a/app", "latest", now.Add(2*time.Minute)); err != nil {
 		t.Fatalf("MarkRepositoryPulled() error = %v", err)
 	}
+	if err := store.MarkRepositoryPulled(ctx, "team-a/app", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", now.Add(3*time.Minute)); err != nil {
+		t.Fatalf("MarkRepositoryPulled(digest) error = %v", err)
+	}
 	if err := store.IncrementUsageCounter(ctx, "team-a/app", domain.ActionPull, now.Add(3*time.Minute)); err != nil {
 		t.Fatalf("IncrementUsageCounter(pull) error = %v", err)
 	}
@@ -87,8 +90,8 @@ func TestStoreRepositoryReadModelFlow(t *testing.T) {
 	if len(tags) != 2 {
 		t.Fatalf("expected two tags, got %d", len(tags))
 	}
-	if tags[0].Tag != "stable" {
-		t.Fatalf("expected newest pushed tag first, got %#v", tags[0])
+	if tags[0].Tag != "stable" || tags[0].PulledAt == nil {
+		t.Fatalf("expected digest pull to update the stable tag, got %#v", tags[0])
 	}
 	if tags[1].Tag != "latest" || tags[1].PulledAt == nil {
 		t.Fatalf("expected latest tag with pull timestamp second, got %#v", tags[1])
