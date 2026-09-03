@@ -720,6 +720,18 @@ func TestOCIConformanceProtocolEdges(t *testing.T) {
 	if strings.Contains(tags.Body.String(), "image") || !strings.Contains(tags.Body.String(), "index") {
 		t.Fatalf("expected tags pagination to exclude last=image and include index, got %s", tags.Body.String())
 	}
+
+	externalDigest := "sha256:" + strings.Repeat("f", 64)
+	nondistributableManifest := []byte(fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":%d},"layers":[{"mediaType":"application/vnd.oci.image.layer.nondistributable.v1.tar+gzip","digest":"%s","size":123456,"urls":["https://store.example.com/blobs/sha256/%s"]}]}`, blobDigest, len(blob), externalDigest, strings.TrimPrefix(externalDigest, "sha256:")))
+	nondistributableDigest := sha256Digest(nondistributableManifest)
+	putNondistributable := putManifestResponse(t, handler, token, "/v2/edge/app/manifests/non-distributable-image", nondistributableManifest)
+	if putNondistributable.Code != http.StatusCreated || putNondistributable.Header().Get("Docker-Content-Digest") != nondistributableDigest {
+		t.Fatalf("expected nondistributable manifest push 201 with digest, got %d digest=%q body=%s", putNondistributable.Code, putNondistributable.Header().Get("Docker-Content-Digest"), putNondistributable.Body.String())
+	}
+	getNondistributable := authenticatedRequest(handler, http.MethodGet, "/v2/edge/app/manifests/non-distributable-image", token, nil)
+	if getNondistributable.Code != http.StatusOK || getNondistributable.Body.String() != string(nondistributableManifest) {
+		t.Fatalf("expected nondistributable manifest pull by tag, got %d: %s", getNondistributable.Code, getNondistributable.Body.String())
+	}
 }
 
 func TestUILoginAndDashboard(t *testing.T) {

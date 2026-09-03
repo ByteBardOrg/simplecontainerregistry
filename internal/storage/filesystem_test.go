@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -219,6 +220,14 @@ func TestPutManifestContentCanBeLinkedAfterward(t *testing.T) {
 	}
 	if resolved != digest {
 		t.Fatalf("expected linked digest %s, got %s", digest, resolved)
+	}
+}
+
+func TestManifestBlobDigestsExcludesNondistributableLayers(t *testing.T) {
+	content := []byte(`{"config":{"digest":"sha256:config"},"layers":[{"mediaType":"application/vnd.oci.image.layer.nondistributable.v1.tar+gzip","digest":"sha256:oci-external"},{"mediaType":"application/vnd.docker.image.rootfs.foreign.diff.tar.gzip","digest":"sha256:docker-external"},{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:local"}]}`)
+	want := []string{"sha256:config", "sha256:local"}
+	if got := ManifestBlobDigests(content); !slices.Equal(got, want) {
+		t.Fatalf("ManifestBlobDigests() = %v, want %v", got, want)
 	}
 }
 

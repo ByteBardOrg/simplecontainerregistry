@@ -806,12 +806,20 @@ func ManifestBlobDigests(content []byte) []string {
 		seen[manifest.Config.Digest] = true
 	}
 	for _, layer := range manifest.Layers {
+		if isNondistributableLayerMediaType(layer.MediaType) {
+			continue
+		}
 		if layer.Digest != "" && !seen[layer.Digest] {
 			digests = append(digests, layer.Digest)
 			seen[layer.Digest] = true
 		}
 	}
 	return digests
+}
+
+func isNondistributableLayerMediaType(mediaType string) bool {
+	return strings.HasPrefix(mediaType, "application/vnd.oci.image.layer.nondistributable.v1.") ||
+		strings.HasPrefix(mediaType, "application/vnd.docker.image.rootfs.foreign.")
 }
 
 func manifestDigestAlgorithm(content []byte) string {
