@@ -189,6 +189,7 @@ Delivered events:
 - `registry.manifest.pulled` with group `registry.pull`
 - `registry.blob.pulled` with group `registry.pull`
 - `registry.manifest.pushed` with group `registry.push`
+- `registry.manifest.tagged` with group `registry.push`
 - `registry.blob.pushed` with group `registry.push`
 - `registry.manifest.deleted` with group `registry.delete`
 - `registry.blob.deleted` with group `registry.delete`
@@ -227,6 +228,23 @@ Payload fields:
 OCI clients can make multiple registry API calls for one high-level image operation. For example, a single `docker pull` usually emits one manifest pull event plus one or more blob pull events.
 
 Registry access denials are stored in audit events as `registry.access.denied` with result `denied`. They are not delivered to registry webhooks.
+
+## Tag management
+
+Tags can be added after a manifest is pushed in either of these ways:
+
+- OCI clients can push the existing manifest body to `/v2/{name}/manifests/{new_tag}`, or push it by digest with `?tag={new_tag}`.
+- Admins can link an existing repository-local manifest without uploading its body with `POST /api/repository-tags/{name}` and a JSON body such as `{"tag":"stable","digest":"sha256:..."}`.
+
+The admin UI exposes the link-only operation on the Repositories page. The digest must already exist in that exact repository; manifests and blobs are not linked across repositories.
+
+Each repository has a tag overwrite protection policy managed with `GET` and `PUT /api/repository-tag-policies/{name}`. The supported modes are:
+
+- `mutable`: all tags may be moved.
+- `immutable`: existing tags cannot be moved to another digest.
+- `pattern`: tags matching the supplied Go/RE2 regular expression cannot be moved to another digest.
+
+The policy defaults to `mutable`. Same-digest retries are allowed. SCR's protection is intentionally overwrite-only: protected tags can still be deleted and the name can later be reused for another digest.
 
 ## API surface
 
@@ -270,6 +288,10 @@ Admin API:
 - `GET /api/repositories`
 - `GET /api/repositories/{name}`
 - `GET /api/repositories/{name}/tags`
+- `GET /api/repository-tags/{name}`
+- `POST /api/repository-tags/{name}`
+- `GET /api/repository-tag-policies/{name}`
+- `PUT /api/repository-tag-policies/{name}`
 - `GET /api/audit-events`
 
 Admin UI:
@@ -281,6 +303,8 @@ Admin UI:
 - `GET /ui/repositories`
 - `POST /ui/repositories/delete`
 - `POST /ui/repositories/delete-tag`
+- `POST /ui/repositories/add-tag`
+- `POST /ui/repositories/tag-policy`
 - `GET /ui/users`
 - `POST /ui/users`
 - `POST /ui/users/{id}/access`
@@ -305,6 +329,9 @@ Implemented:
 - One-secret-per-user onboarding
 - Date-only user validity management in the UI
 - Repository UI tag deletion and delete-all repository actions
+- Link-only post-push tag creation through the admin API and UI
+- Per-repository tag overwrite protection with mutable, all-tag, and regex-selected modes
+- Atomic tag reference replacement and policy-aware OCI manifest pushes
 - Repository UI accordion view with tag metadata, newest-pushed-first ordering, and client-side tag table sorting
 - Customer access UI for repository-prefix grants, including wildcard `*`, pull, push, and delete actions
 - Audit UI filtering by query and action class

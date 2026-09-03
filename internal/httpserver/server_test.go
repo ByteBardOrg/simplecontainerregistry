@@ -317,6 +317,172 @@ func TestRegistryBlobManifestAndTagsFlow(t *testing.T) {
 	}
 }
 
+func TestBuildRepositoryGroups(t *testing.T) {
+	names := []string{
+		"shieldedstack/worker",
+		"org/team/worker",
+		"root",
+		"shieldedstack/migrationservice",
+		"org/api",
+		"org/team/app",
+	}
+	views := make([]repositoryView, 0, len(names))
+	for _, repository := range names {
+		namespace, name := splitRepositoryName(repository)
+		views = append(views, repositoryView{
+			Repository: domain.Repository{Name: repository},
+			Namespace:  namespace,
+			Name:       name,
+		})
+	}
+
+	got := buildRepositoryGroups(views)
+	wantNamespaces := []string{"", "org", "org/team", "shieldedstack"}
+	wantNames := [][]string{
+		{"root"},
+		{"api"},
+		{"app", "worker"},
+		{"migrationservice", "worker"},
+	}
+	if len(got) != len(wantNamespaces) {
+		t.Fatalf("repository group count = %d, want %d", len(got), len(wantNamespaces))
+	}
+	for i, group := range got {
+		if group.Namespace != wantNamespaces[i] || len(group.Repositories) != len(wantNames[i]) {
+			t.Fatalf("repository group at index %d = %#v, want namespace=%q with %d repositories", i, group, wantNamespaces[i], len(wantNames[i]))
+		}
+		for j, repository := range group.Repositories {
+			if repository.Name != wantNames[i][j] {
+				t.Fatalf("repository at group %d index %d = %q, want %q", i, j, repository.Name, wantNames[i][j])
+			}
+		}
+	}
+}
+
+func TestRepositoryTagManagementAndOverwriteProtection(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.Storage.RootDirectory = filepath.Join(t.TempDir(), "registry")
+	cfg.Database.DSN = filepath.Join(t.TempDir(), "test.db")
+	store, err := db.Open(ctx, cfg.Database.DSN)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.InitSchema(ctx); err != nil {
+		t.Fatalf("InitSchema() error = %v", err)
+	}
+	if err := store.EnsureActiveSigningKey(ctx); err != nil {
+		t.Fatalf("EnsureActiveSigningKey() error = %v", err)
+	}
+	createHTTPTestUser(t, ctx, store, "admin", "Admin", domain.RoleAdmin, "admin-secret", time.Now().UTC())
+	handler := New(Options{Config: cfg, Store: store})
+	token := requestToken(t, handler, "admin", "admin-secret", "repository:policy/app:pull,push,delete")
+
+	requestAPI := func(method, path, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+token)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	putManifest := func(tag string, content []byte) string {
+		request := httptest.NewRequest(http.MethodPut, "/v2/policy/app/manifests/"+tag, bytes.NewReader(content))
+		request.Header.Set("Authorization", "Bearer "+token)
+		request.Header.Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("manifest push %s status = %d: %s", tag, response.Code, response.Body.String())
+		}
+		return response.Header().Get("Docker-Content-Digest")
+	}
+	if missingPolicy := requestAPI(http.MethodGet, "/api/repository-tag-policies/missing/app", ""); missingPolicy.Code != http.StatusNotFound {
+		t.Fatalf("missing repository policy status = %d: %s", missingPolicy.Code, missingPolicy.Body.String())
+	}
+
+	manifestOne := []byte(`{"schemaVersion":2,"version":1}`)
+	manifestTwo := []byte(`{"schemaVersion":2,"version":2}`)
+	digestOne := putManifest("initial", manifestOne)
+	digestTwo := sha256Digest(manifestTwo)
+
+	addTag := requestAPI(http.MethodPost, "/api/repository-tags/policy/app", `{"tag":"stable","digest":"`+digestOne+`"}`)
+	if addTag.Code != http.StatusCreated {
+		t.Fatalf("add tag status = %d: %s", addTag.Code, addTag.Body.String())
+	}
+	var createdTag domain.RepositoryTag
+	if err := json.NewDecoder(addTag.Body).Decode(&createdTag); err != nil {
+		t.Fatalf("decode created tag: %v", err)
+	}
+	if createdTag.Tag != "stable" || createdTag.Digest != digestOne {
+		t.Fatalf("unexpected created tag: %#v", createdTag)
+	}
+	if sameTag := requestAPI(http.MethodPost, "/api/repository-tags/policy/app", `{"tag":"stable","digest":"`+digestOne+`"}`); sameTag.Code != http.StatusCreated {
+		t.Fatalf("same-digest tag retry status = %d: %s", sameTag.Code, sameTag.Body.String())
+	}
+
+	policyResponse := requestAPI(http.MethodPut, "/api/repository-tag-policies/policy/app", `{"mode":"immutable"}`)
+	if policyResponse.Code != http.StatusOK || !strings.Contains(policyResponse.Body.String(), `"mode":"immutable"`) {
+		t.Fatalf("set immutable policy status = %d: %s", policyResponse.Code, policyResponse.Body.String())
+	}
+	if addTag := requestAPI(http.MethodPost, "/api/repository-tags/policy/app", `{"tag":"release","digest":"`+digestTwo+`"}`); addTag.Code != http.StatusNotFound {
+		t.Fatalf("missing manifest tag status = %d: %s", addTag.Code, addTag.Body.String())
+	}
+	if sourceTag := requestAPI(http.MethodPost, "/api/repository-tags/policy/app", `{"tag":"release","digest":"initial"}`); sourceTag.Code != http.StatusBadRequest {
+		t.Fatalf("tag source reference status = %d: %s", sourceTag.Code, sourceTag.Body.String())
+	}
+	if overwrite := putManifestResponse(t, handler, token, "/v2/policy/app/manifests/initial", manifestTwo); overwrite.Code != http.StatusConflict {
+		t.Fatalf("protected OCI overwrite status = %d: %s", overwrite.Code, overwrite.Body.String())
+	}
+	stableManifest := authenticatedRequest(handler, http.MethodGet, "/v2/policy/app/manifests/stable", token, nil)
+	if stableManifest.Code != http.StatusOK || stableManifest.Body.String() != string(manifestOne) {
+		t.Fatalf("protected tag changed after rejected overwrite: status=%d body=%s", stableManifest.Code, stableManifest.Body.String())
+	}
+	if addTag := requestAPI(http.MethodPost, "/api/repository-tags/policy/app", `{"tag":"release","digest":"`+digestTwo+`"}`); addTag.Code != http.StatusCreated {
+		t.Fatalf("tagging untagged manifest status = %d: %s", addTag.Code, addTag.Body.String())
+	}
+	if retarget := requestAPI(http.MethodPost, "/api/repository-tags/policy/app", `{"tag":"stable","digest":"`+digestTwo+`"}`); retarget.Code != http.StatusConflict {
+		t.Fatalf("protected admin retarget status = %d: %s", retarget.Code, retarget.Body.String())
+	}
+	if deleted := authenticatedRequest(handler, http.MethodDelete, "/v2/policy/app/manifests/stable", token, nil); deleted.Code != http.StatusAccepted {
+		t.Fatalf("protected tag delete status = %d: %s", deleted.Code, deleted.Body.String())
+	}
+	if reused := requestAPI(http.MethodPost, "/api/repository-tags/policy/app", `{"tag":"stable","digest":"`+digestTwo+`"}`); reused.Code != http.StatusCreated {
+		t.Fatalf("deleted protected tag reuse status = %d: %s", reused.Code, reused.Body.String())
+	}
+
+	patternResponse := requestAPI(http.MethodPut, "/api/repository-tag-policies/policy/app", `{"mode":"pattern","pattern":"^v"}`)
+	if patternResponse.Code != http.StatusOK || !strings.Contains(patternResponse.Body.String(), `"pattern":"^v"`) {
+		t.Fatalf("set pattern policy status = %d: %s", patternResponse.Code, patternResponse.Body.String())
+	}
+	putManifest("v1", manifestOne)
+	if overwrite := putManifestResponse(t, handler, token, "/v2/policy/app/manifests/v1", manifestTwo); overwrite.Code != http.StatusConflict {
+		t.Fatalf("pattern-protected OCI overwrite status = %d: %s", overwrite.Code, overwrite.Body.String())
+	}
+	putManifest("latest", manifestOne)
+	if overwrite := putManifestResponse(t, handler, token, "/v2/policy/app/manifests/latest", manifestTwo); overwrite.Code != http.StatusCreated {
+		t.Fatalf("pattern-excluded OCI overwrite status = %d: %s", overwrite.Code, overwrite.Body.String())
+	}
+	if invalid := requestAPI(http.MethodPut, "/api/repository-tag-policies/policy/app", `{"mode":"pattern","pattern":"["}`); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid policy pattern status = %d: %s", invalid.Code, invalid.Body.String())
+	}
+	policyGet := authenticatedRequest(handler, http.MethodGet, "/api/repository-tag-policies/policy/app", token, nil)
+	if policyGet.Code != http.StatusOK || !strings.Contains(policyGet.Body.String(), `"mode":"pattern"`) {
+		t.Fatalf("get policy status = %d: %s", policyGet.Code, policyGet.Body.String())
+	}
+}
+
+func putManifestResponse(t *testing.T, handler http.Handler, token, path string, content []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPut, path, bytes.NewReader(content))
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
 func TestPullOnlyReaderCanListAndPullButNotPush(t *testing.T) {
 	ctx := context.Background()
 	cfg := config.Default()
@@ -769,7 +935,13 @@ func TestUILoginAndDashboard(t *testing.T) {
 	if !strings.Contains(repositoriesResponse.Body.String(), "ui/app") || !strings.Contains(repositoriesResponse.Body.String(), "latest") || !strings.Contains(repositoriesResponse.Body.String(), "stable") {
 		t.Fatalf("expected repositories UI to show pushed tags, got %s", repositoriesResponse.Body.String())
 	}
-	if !strings.Contains(repositoriesResponse.Body.String(), "Search repositories, namespaces, tags, or digests") || !strings.Contains(repositoriesResponse.Body.String(), "Delete image repository") {
+	if !strings.Contains(repositoriesResponse.Body.String(), `<h2 class="repo-group-label">ui</h2>`) || !strings.Contains(repositoriesResponse.Body.String(), `<span class="repo-group-count">1 repository</span>`) {
+		t.Fatalf("expected repositories UI to show a single ui namespace group, got %s", repositoriesResponse.Body.String())
+	}
+	if strings.Contains(repositoriesResponse.Body.String(), "namespace: ui") || !strings.Contains(repositoriesResponse.Body.String(), `<strong title="ui/app">app</strong>`) {
+		t.Fatalf("expected repositories UI to show the leaf name once and retain the full path in details, got %s", repositoriesResponse.Body.String())
+	}
+	if !strings.Contains(repositoriesResponse.Body.String(), "Search repositories, namespaces, tags, or digests") || !strings.Contains(repositoriesResponse.Body.String(), "Delete image repository") || !strings.Contains(repositoriesResponse.Body.String(), "Manage tags") || !strings.Contains(repositoriesResponse.Body.String(), "Tag management") || !strings.Contains(repositoriesResponse.Body.String(), "Add tag") || !strings.Contains(repositoriesResponse.Body.String(), "Overwrite policy") || strings.Contains(repositoriesResponse.Body.String(), "repository-actions") {
 		t.Fatalf("expected repositories UI search and clear delete copy, got %s", repositoriesResponse.Body.String())
 	}
 	if !strings.Contains(repositoriesResponse.Body.String(), "Browse pushed images, inspect tags, and remove stale image references") || !strings.Contains(repositoriesResponse.Body.String(), "This removes all tag references and tagged manifests for this exact image repository only") {
@@ -777,6 +949,9 @@ func TestUILoginAndDashboard(t *testing.T) {
 	}
 	if !strings.Contains(repositoriesResponse.Body.String(), "Digest") || !strings.Contains(repositoriesResponse.Body.String(), "Media Type") || !strings.Contains(repositoriesResponse.Body.String(), "Pushed") {
 		t.Fatalf("expected tag metadata table, got %s", repositoriesResponse.Body.String())
+	}
+	if !strings.Contains(repositoriesResponse.Body.String(), `class="mono digest-cell"`) || !strings.Contains(repositoriesResponse.Body.String(), `role="button" tabindex="0"`) {
+		t.Fatalf("expected digest text to be the accessible copy target, got %s", repositoriesResponse.Body.String())
 	}
 	pulledAt := uiTags[0].PulledAt.UTC().Format("2006-01-02 15:04:05 UTC")
 	if !strings.Contains(repositoriesResponse.Body.String(), pulledAt) {
@@ -788,6 +963,35 @@ func TestUILoginAndDashboard(t *testing.T) {
 	if !strings.Contains(repositoriesResponse.Body.String(), "Deleting a tag removes only that tag reference") || !strings.Contains(repositoriesResponse.Body.String(), "It does not delete the manifest content") {
 		t.Fatalf("expected tag delete semantics copy, got %s", repositoriesResponse.Body.String())
 	}
+	addTagForm := url.Values{}
+	addTagForm.Set("repository", "ui/app")
+	addTagForm.Set("tag", "copy")
+	addTagForm.Set("digest", uiManifestDigest)
+	addTagRequest := httptest.NewRequest(http.MethodPost, "/ui/repositories/add-tag", strings.NewReader(addTagForm.Encode()))
+	addTagRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	addTagRequest.AddCookie(sessionCookie)
+	addUICSRF(addTagRequest, sessionCookie)
+	addTagResponse := httptest.NewRecorder()
+	handler.ServeHTTP(addTagResponse, addTagRequest)
+	if addTagResponse.Code != http.StatusFound {
+		t.Fatalf("expected UI add tag redirect, got %d: %s", addTagResponse.Code, addTagResponse.Body.String())
+	}
+	policyForm := url.Values{}
+	policyForm.Set("repository", "ui/app")
+	policyForm.Set("mode", "immutable")
+	policyRequest := httptest.NewRequest(http.MethodPost, "/ui/repositories/tag-policy", strings.NewReader(policyForm.Encode()))
+	policyRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	policyRequest.AddCookie(sessionCookie)
+	addUICSRF(policyRequest, sessionCookie)
+	policyResponse := httptest.NewRecorder()
+	handler.ServeHTTP(policyResponse, policyRequest)
+	if policyResponse.Code != http.StatusFound {
+		t.Fatalf("expected UI tag policy redirect, got %d: %s", policyResponse.Code, policyResponse.Body.String())
+	}
+	uiPolicy, err := store.GetRepositoryTagPolicy(ctx, "ui/app")
+	if err != nil || uiPolicy.Mode != domain.TagPolicyImmutable {
+		t.Fatalf("expected UI tag policy to persist, policy=%#v err=%v", uiPolicy, err)
+	}
 	searchRequest := httptest.NewRequest(http.MethodGet, "/ui/repositories?q=stable", nil)
 	searchRequest.AddCookie(sessionCookie)
 	searchResponse := httptest.NewRecorder()
@@ -797,6 +1001,9 @@ func TestUILoginAndDashboard(t *testing.T) {
 	}
 	if !strings.Contains(searchResponse.Body.String(), `value="stable"`) || !strings.Contains(searchResponse.Body.String(), "ui/app") {
 		t.Fatalf("expected repository search to preserve query and return tag match, got %s", searchResponse.Body.String())
+	}
+	if !strings.Contains(searchResponse.Body.String(), `<span class="repo-group-count">1 repository</span>`) {
+		t.Fatalf("expected filtered repository search to recalculate the namespace count, got %s", searchResponse.Body.String())
 	}
 	missingSearchRequest := httptest.NewRequest(http.MethodGet, "/ui/repositories?q=no-such-tag", nil)
 	missingSearchRequest.AddCookie(sessionCookie)

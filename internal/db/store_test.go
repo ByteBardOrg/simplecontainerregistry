@@ -141,6 +141,65 @@ func TestStoreRepositoryReadModelFlow(t *testing.T) {
 	}
 }
 
+func TestStoreRepositoryTagPolicyAndDistinctSizeFlow(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, ctx)
+	now := time.Now().UTC().Truncate(time.Second)
+
+	policy, err := store.GetRepositoryTagPolicy(ctx, "team-a/app")
+	if err != nil {
+		t.Fatalf("GetRepositoryTagPolicy(default) error = %v", err)
+	}
+	if policy.RepositoryName != "team-a/app" || policy.Mode != domain.TagPolicyMutable || policy.Pattern != "" {
+		t.Fatalf("unexpected default tag policy: %#v", policy)
+	}
+
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if err := store.UpsertRepositoryTag(ctx, UpsertRepositoryTagParams{RepositoryName: "team-a/app", Tag: "latest", Digest: digest, SizeBytes: 123}, now); err != nil {
+		t.Fatalf("UpsertRepositoryTag(latest) error = %v", err)
+	}
+	if _, err := store.UpdateRepositoryTagPolicy(ctx, domain.RepositoryTagPolicy{
+		RepositoryName: "team-a/app",
+		Mode:           domain.TagPolicyPattern,
+		Pattern:        `^v[0-9]+$`,
+	}, now); err != nil {
+		t.Fatalf("UpdateRepositoryTagPolicy() error = %v", err)
+	}
+	policy, err = store.GetRepositoryTagPolicy(ctx, "team-a/app")
+	if err != nil {
+		t.Fatalf("GetRepositoryTagPolicy(updated) error = %v", err)
+	}
+	if policy.Mode != domain.TagPolicyPattern || policy.Pattern != `^v[0-9]+$` || policy.UpdatedAt == nil {
+		t.Fatalf("unexpected updated tag policy: %#v", policy)
+	}
+	if _, err := store.UpdateRepositoryTagPolicy(ctx, domain.RepositoryTagPolicy{RepositoryName: "team-a/app", Mode: domain.TagPolicyPattern, Pattern: `[`}, now); err == nil {
+		t.Fatal("expected invalid tag policy pattern to fail")
+	}
+	if _, err := store.UpdateRepositoryTagPolicy(ctx, domain.RepositoryTagPolicy{RepositoryName: "team-a/app", Mode: domain.TagPolicyMode("unknown")}, now); err == nil {
+		t.Fatal("expected invalid tag policy mode to fail")
+	}
+	if err := store.UpsertRepositoryTag(ctx, UpsertRepositoryTagParams{RepositoryName: "team-a/app", Tag: "stable", Digest: digest, SizeBytes: 123}, now.Add(time.Minute)); err != nil {
+		t.Fatalf("UpsertRepositoryTag(stable) error = %v", err)
+	}
+	repository, err := store.GetRepository(ctx, "team-a/app")
+	if err != nil {
+		t.Fatalf("GetRepository() error = %v", err)
+	}
+	if repository.TagCount != 2 || repository.ManifestCount != 1 || repository.SizeBytes != 123 {
+		t.Fatalf("expected distinct manifest size accounting, got %#v", repository)
+	}
+	if err := store.DeleteRepository(ctx, "team-a/app"); err != nil {
+		t.Fatalf("DeleteRepository() error = %v", err)
+	}
+	policy, err = store.GetRepositoryTagPolicy(ctx, "team-a/app")
+	if err != nil {
+		t.Fatalf("GetRepositoryTagPolicy(after delete) error = %v", err)
+	}
+	if policy.Mode != domain.TagPolicyMutable || policy.UpdatedAt != nil {
+		t.Fatalf("expected deleted repository policy to reset to default, got %#v", policy)
+	}
+}
+
 func TestStoreGCSettings(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t, ctx)

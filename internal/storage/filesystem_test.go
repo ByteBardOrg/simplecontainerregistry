@@ -197,6 +197,31 @@ func TestFilesystemRejectsUnsafeTagReferences(t *testing.T) {
 	}
 }
 
+func TestPutManifestContentCanBeLinkedAfterward(t *testing.T) {
+	fs, err := NewFilesystem(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFilesystem() error = %v", err)
+	}
+	content := []byte(`{"schemaVersion":2}`)
+	digest := sha256DigestForTest(content)
+	if _, _, err := fs.PutManifestContent("team/app", digest, "application/vnd.oci.image.manifest.v1+json", content); err != nil {
+		t.Fatalf("PutManifestContent() error = %v", err)
+	}
+	if _, _, _, err := fs.GetManifest("team/app", "release"); err == nil {
+		t.Fatal("expected manifest to be untagged before linking")
+	}
+	if err := fs.LinkManifestTag("team/app", "release", digest); err != nil {
+		t.Fatalf("LinkManifestTag() error = %v", err)
+	}
+	resolved, err := fs.ManifestTagDigest("team/app", "release")
+	if err != nil {
+		t.Fatalf("ManifestTagDigest() error = %v", err)
+	}
+	if resolved != digest {
+		t.Fatalf("expected linked digest %s, got %s", digest, resolved)
+	}
+}
+
 func touchTree(path string, at time.Time) error {
 	return os.Chtimes(path, at, at)
 }

@@ -103,6 +103,8 @@ var uiTemplates = template.Must(template.New("ui").Funcs(template.FuncMap{
 		switch {
 		case strings.Contains(action, "pushed") || strings.Contains(action, "push"):
 			return "cloud_upload"
+		case strings.Contains(action, "tagged"):
+			return "label"
 		case strings.Contains(action, "pulled") || strings.Contains(action, "pull"):
 			return "cloud_download"
 		case strings.Contains(action, "login") || strings.Contains(action, "token"):
@@ -115,7 +117,9 @@ var uiTemplates = template.Must(template.New("ui").Funcs(template.FuncMap{
 			return "settings"
 		}
 	},
-	"resultClass": auditResultClass,
+	"resultClass":          auditResultClass,
+	"repositoryGroupLabel": repositoryGroupLabel,
+	"repositoryCountLabel": repositoryCountLabel,
 }).Parse(uiTemplateText))
 
 type uiPage struct {
@@ -130,7 +134,7 @@ type uiPage struct {
 	TrafficRepos     []trafficRepositoryGroupView
 	SelectedTraffic  string
 	Users            []userAccessView
-	Repos            []repositoryView
+	RepoGroups       []repositoryGroupView
 	SearchQuery      string
 	ActionFilter     string
 	GCSettings       domain.GCSettings
@@ -157,8 +161,14 @@ type userAccessView struct {
 type repositoryView struct {
 	Repository domain.Repository
 	Tags       []domain.RepositoryTag
+	Policy     domain.RepositoryTagPolicy
 	Namespace  string
 	Name       string
+}
+
+type repositoryGroupView struct {
+	Namespace    string
+	Repositories []repositoryView
 }
 
 type auditEventView struct {
@@ -368,7 +378,7 @@ func (s *Server) handleUIRepositories(w http.ResponseWriter, r *http.Request) {
 		s.renderUI(w, r, "repositories", uiPage{Title: "Repositories", Active: "repositories", SearchQuery: query, Error: "Failed to load repositories"})
 		return
 	}
-	s.renderUI(w, r, "repositories", uiPage{Title: "Repositories", Active: "repositories", Repos: repos, SearchQuery: query})
+	s.renderUI(w, r, "repositories", uiPage{Title: "Repositories", Active: "repositories", RepoGroups: buildRepositoryGroups(repos), SearchQuery: query})
 }
 
 func (s *Server) handleUIRepositoryTagDelete(w http.ResponseWriter, r *http.Request) {
@@ -387,6 +397,80 @@ func (s *Server) handleUIRepositoryTagDelete(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if err := s.audit(r, "registry.manifest.deleted", "repository", repository, "success"); err != nil {
+		s.renderRepositoriesWithError(w, r, "Failed to write audit event")
+		return
+	}
+	http.Redirect(w, r, "/ui/repositories", http.StatusFound)
+}
+
+func (s *Server) handleUIRepositoryTagAdd(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		s.renderRepositoriesWithError(w, r, "Invalid form submission")
+		return
+	}
+	repository := strings.TrimSpace(r.FormValue("repository"))
+	tag := strings.TrimSpace(r.FormValue("tag"))
+	digest := strings.TrimSpace(r.FormValue("digest"))
+	if repository == "" || tag == "" || digest == "" {
+		s.renderRepositoriesWithError(w, r, "Repository, tag, and digest are required")
+		return
+	}
+	if err := storage.ValidateRepository(repository); err != nil {
+		s.renderRepositoriesWithError(w, r, "Invalid repository")
+		return
+	}
+	if err := storage.ValidateTag(tag); err != nil {
+		s.renderRepositoriesWithError(w, r, "Invalid tag")
+		return
+	}
+	if _, err := s.addRepositoryTag(r.Context(), repository, tag, digest, time.Now().UTC()); err != nil {
+		message := "Failed to add tag"
+		if errors.Is(err, ErrTagOverwriteProtected) {
+			message = "Tag is protected from overwrite"
+		} else if errors.Is(err, storage.ErrNotFound) {
+			message = "Manifest digest was not found"
+		}
+		s.renderRepositoriesWithError(w, r, message)
+		return
+	}
+	if err := s.store.IncrementUsageCounter(r.Context(), repository, domain.ActionPush, time.Now().UTC()); err != nil {
+		s.renderRepositoriesWithError(w, r, "Failed to update usage counters")
+		return
+	}
+	if err := s.audit(r, "registry.manifest.tagged", "repository", repository, "success"); err != nil {
+		s.renderRepositoriesWithError(w, r, "Failed to write audit event")
+		return
+	}
+	http.Redirect(w, r, "/ui/repositories", http.StatusFound)
+}
+
+func (s *Server) handleUIRepositoryTagPolicyUpdate(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		s.renderRepositoriesWithError(w, r, "Invalid form submission")
+		return
+	}
+	repository := strings.TrimSpace(r.FormValue("repository"))
+	if repository == "" {
+		s.renderRepositoriesWithError(w, r, "Repository is required")
+		return
+	}
+	if err := storage.ValidateRepository(repository); err != nil {
+		s.renderRepositoriesWithError(w, r, "Invalid repository")
+		return
+	}
+	err := s.withTagMutationLock(repository, func() error {
+		_, err := s.store.UpdateRepositoryTagPolicy(r.Context(), domain.RepositoryTagPolicy{
+			RepositoryName: repository,
+			Mode:           domain.TagPolicyMode(strings.TrimSpace(r.FormValue("mode"))),
+			Pattern:        strings.TrimSpace(r.FormValue("pattern")),
+		}, time.Now().UTC())
+		return err
+	})
+	if err != nil {
+		s.renderRepositoriesWithError(w, r, err.Error())
+		return
+	}
+	if err := s.audit(r, "repository.tag_policy.updated", "repository", repository, "success"); err != nil {
 		s.renderRepositoriesWithError(w, r, "Failed to write audit event")
 		return
 	}
@@ -441,7 +525,7 @@ func (s *Server) renderRepositoriesWithError(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		message = "Failed to load repositories"
 	}
-	s.renderUI(w, r, "repositories", uiPage{Title: "Repositories", Active: "repositories", Error: message, Repos: repos, SearchQuery: query})
+	s.renderUI(w, r, "repositories", uiPage{Title: "Repositories", Active: "repositories", Error: message, RepoGroups: buildRepositoryGroups(repos), SearchQuery: query})
 }
 
 func (s *Server) loadRepositoryViews(r *http.Request, query string) ([]repositoryView, error) {
@@ -459,10 +543,51 @@ func (s *Server) loadRepositoryViews(r *http.Request, query string) ([]repositor
 		if query != "" && !repositoryMatchesQuery(repository, tags, query) {
 			continue
 		}
+		policy, err := s.store.GetRepositoryTagPolicy(r.Context(), repository.Name)
+		if err != nil {
+			return nil, err
+		}
 		namespace, name := splitRepositoryName(repository.Name)
-		views = append(views, repositoryView{Repository: repository, Tags: tags, Namespace: namespace, Name: name})
+		views = append(views, repositoryView{Repository: repository, Tags: tags, Policy: policy, Namespace: namespace, Name: name})
 	}
 	return views, nil
+}
+
+func buildRepositoryGroups(views []repositoryView) []repositoryGroupView {
+	byNamespace := make(map[string][]repositoryView)
+	for _, view := range views {
+		byNamespace[view.Namespace] = append(byNamespace[view.Namespace], view)
+	}
+
+	namespaces := make([]string, 0, len(byNamespace))
+	for namespace := range byNamespace {
+		namespaces = append(namespaces, namespace)
+	}
+	sort.Strings(namespaces)
+
+	groups := make([]repositoryGroupView, 0, len(namespaces))
+	for _, namespace := range namespaces {
+		repositories := byNamespace[namespace]
+		sort.SliceStable(repositories, func(i, j int) bool {
+			return repositories[i].Name < repositories[j].Name
+		})
+		groups = append(groups, repositoryGroupView{Namespace: namespace, Repositories: repositories})
+	}
+	return groups
+}
+
+func repositoryGroupLabel(namespace string) string {
+	if namespace == "" {
+		return "Root"
+	}
+	return namespace
+}
+
+func repositoryCountLabel(count int) string {
+	if count == 1 {
+		return "1 repository"
+	}
+	return fmt.Sprintf("%d repositories", count)
 }
 
 func repositoryMatchesQuery(repository domain.Repository, tags []domain.RepositoryTag, query string) bool {
@@ -1028,28 +1153,58 @@ const uiTemplateText = `
     .numeric { text-align:right; color:var(--muted); }
     .user-cell { display:flex; align-items:center; gap:8px; }
     .avatar { width:32px; height:32px; border-radius:999px; display:grid; place-items:center; background:var(--secondary-container); color:var(--primary); font:800 12px/1 Geist, sans-serif; }
-    .repo-list { display:flex; flex-direction:column; gap:12px; }
-    .repo-card { background:var(--surface); border:1px solid var(--line); border-radius:12px; box-shadow:0 4px 12px rgba(0,0,0,.02); overflow:hidden; }
-    .repo-card summary { cursor:pointer; list-style:none; }
-    .repo-card summary::-webkit-details-marker { display:none; }
-    .repo-summary { display:grid; grid-template-columns:minmax(260px, 1fr) repeat(4, auto); gap:16px; align-items:center; padding:16px; background:var(--surface-low); }
-    .repo-name { display:flex; flex-direction:column; gap:2px; }
-    .repo-name strong { color:var(--primary); font:700 15px/20px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    .repo-namespace { color:var(--outline); font:500 12px/16px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    .repo-metric { display:flex; flex-direction:column; gap:2px; min-width:82px; color:var(--muted); font:600 11px/14px Geist, sans-serif; text-transform:uppercase; letter-spacing:.04em; }
-    .repo-metric strong { color:var(--ink); font:600 14px/20px Geist, sans-serif; text-transform:none; letter-spacing:0; }
-    .repo-body { padding:16px; }
-    .repo-body-head { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:12px; }
+     .repo-list { display:flex; flex-direction:column; gap:32px; }
+     .repo-group { min-width:0; }
+     .repo-group-heading { display:flex; align-items:center; justify-content:space-between; gap:16px; padding-bottom:8px; border-bottom:1px solid var(--line); }
+     .repo-group-title { min-width:0; display:flex; align-items:baseline; gap:10px; }
+     .repo-group-label { min-width:0; margin:0; color:var(--muted); font:600 13px/18px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing:.04em; overflow-wrap:anywhere; }
+     .repo-group-count { color:var(--outline); font:500 12px/16px Inter, sans-serif; white-space:nowrap; }
+     .repo-group-rows { min-width:0; }
+     .repo-card { background:transparent; border:0; border-bottom:1px solid rgba(197,197,211,.65); border-radius:0; box-shadow:none; overflow:visible; }
+     .repo-card summary { cursor:pointer; list-style:none; }
+     .repo-card summary::-webkit-details-marker { display:none; }
+     .repo-summary { display:grid; grid-template-columns:minmax(260px, 1fr) repeat(4, auto); gap:16px; align-items:center; padding:14px 0; background:transparent; }
+     .repo-name { display:flex; flex-direction:column; gap:2px; min-width:0; }
+     .repo-name-line { display:flex; align-items:center; gap:8px; min-width:0; }
+     .repo-expand { color:var(--outline); font-size:18px; transition:transform .12s ease, color .12s ease; }
+     .repo-card[open] .repo-expand { color:var(--primary); transform:rotate(90deg); }
+     .repo-name strong { color:var(--primary); font:700 15px/20px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap:anywhere; }
+     .repo-metric { display:flex; flex-direction:column; gap:2px; min-width:82px; color:var(--muted); font:600 11px/14px Geist, sans-serif; text-transform:uppercase; letter-spacing:.04em; }
+     .repo-metric strong { color:var(--ink); font:600 14px/20px Geist, sans-serif; text-transform:none; letter-spacing:0; }
+     .repo-body { padding:0 0 16px 26px; }
+     .repo-expanded-name { display:block; margin-bottom:2px; color:var(--primary); font:700 13px/20px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap:anywhere; }
+     .repo-section-label { display:block; margin-bottom:2px; }
+     .repo-body-head { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:12px; }
     .tag-table table { min-width:980px; }
-    .tag-table th { cursor:pointer; }
-    .tag-table th:hover { color:var(--primary); }
-    .tag-name { color:var(--primary); font:700 13px/20px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    .tag-delete { width:20px; height:20px; border:0; border-radius:999px; background:var(--error-bg); color:var(--error); cursor:pointer; display:grid; place-items:center; font:700 12px/1 Geist, sans-serif; }
+     .tag-table th { cursor:pointer; }
+     .tag-table th:hover { color:var(--primary); }
+     .tag-name { color:var(--primary); font:700 13px/20px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+     .digest-cell { cursor:copy; user-select:text; }
+     .digest-cell:hover, .digest-cell:focus-visible { color:var(--primary); text-decoration:underline; text-decoration-style:dotted; text-underline-offset:3px; outline:none; }
+     .digest-cell[data-copy-state="copied"] { color:var(--success); }
+     .digest-cell[data-copy-state="copied"]::after { content:" copied"; font:600 11px/16px Inter, sans-serif; }
+     .tag-delete { width:20px; height:20px; border:0; border-radius:999px; background:var(--error-bg); color:var(--error); cursor:pointer; display:grid; place-items:center; font:700 12px/1 Geist, sans-serif; }
     .grant-list { display:flex; flex-direction:column; gap:8px; min-width:360px; }
     .grant-row { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px; border:1px solid var(--line); border-radius:8px; background:var(--white); }
     .grant-prefix { color:var(--primary); font:700 12px/16px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    .grant-form { display:grid; grid-template-columns:minmax(140px, 1fr) auto auto; gap:8px; align-items:end; }
-    .check-group { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding-bottom:8px; }
+      .grant-form { display:grid; grid-template-columns:minmax(140px, 1fr) auto auto; gap:8px; align-items:end; }
+      .namespace-management { position:relative; flex:0 0 auto; }
+      .namespace-management > summary { list-style:none; cursor:pointer; }
+      .namespace-management > summary::-webkit-details-marker { display:none; }
+      .namespace-management[open] > summary { background:var(--primary-container); }
+      .namespace-management-panel { position:absolute; z-index:25; top:calc(100% + 8px); right:0; width:min(720px, calc(100vw - 48px)); max-height:min(600px, calc(100vh - 120px)); overflow:auto; padding:16px; background:var(--white); border:1px solid var(--line); border-radius:12px; box-shadow:0 16px 36px rgba(0,0,0,.16); }
+      .namespace-management-head { display:flex; flex-direction:column; gap:2px; padding-bottom:12px; border-bottom:1px solid var(--line); }
+      .namespace-management-head strong { font:600 16px/24px Geist, sans-serif; }
+      .namespace-management-head span { color:var(--muted); font:400 13px/18px Inter, sans-serif; }
+      .namespace-management-list { display:flex; flex-direction:column; }
+      .namespace-management-row { padding:14px 0; border-bottom:1px solid rgba(197,197,211,.65); }
+      .namespace-management-row:last-child { border-bottom:0; padding-bottom:0; }
+      .namespace-management-repo { display:flex; align-items:center; justify-content:space-between; gap:12px; min-width:0; }
+      .namespace-management-repo .mono { min-width:0; color:var(--primary); overflow-wrap:anywhere; }
+      .namespace-management-forms { display:grid; gap:10px; margin-top:10px; }
+      .namespace-management-form { display:grid; grid-template-columns:minmax(110px, .8fr) minmax(180px, 1.7fr) auto; gap:8px; align-items:end; }
+      .namespace-management-form button { white-space:nowrap; }
+     .check-group { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding-bottom:8px; }
     .check-group label { display:inline-flex; align-items:center; gap:4px; margin:0; }
     .check-group input { width:auto; }
     .user-card-list { display:flex; flex-direction:column; gap:12px; }
@@ -1109,7 +1264,7 @@ const uiTemplateText = `
     .modal-actions { display:flex; justify-content:flex-end; gap:8px; }
     .secondary-action { border:1px solid var(--line); background:var(--white); color:var(--muted); border-radius:8px; padding:8px 12px; min-height:38px; cursor:pointer; font:600 14px/20px Geist, sans-serif; }
     @media (max-width: 1100px) { .stat-grid { grid-template-columns:repeat(3, minmax(0, 1fr)); } .bento { grid-template-columns:1fr; } .form-grid { grid-template-columns:1fr 1fr; } }
-    @media (max-width: 800px) { .sidenav { position:static; width:auto; min-height:auto; border-right:0; border-bottom:1px solid var(--line); } .main-shell { margin-left:0; } .topbar { padding:0 16px; } .canvas { padding:16px; } .stat-grid { grid-template-columns:repeat(2, minmax(0, 1fr)); } .page-header { flex-direction:column; } .form-grid { grid-template-columns:1fr; min-width:0; } }
+     @media (max-width: 800px) { .sidenav { position:static; width:auto; min-height:auto; border-right:0; border-bottom:1px solid var(--line); } .main-shell { margin-left:0; } .topbar { padding:0 16px; } .canvas { padding:16px; } .stat-grid { grid-template-columns:repeat(2, minmax(0, 1fr)); } .page-header { flex-direction:column; } .form-grid { grid-template-columns:1fr; min-width:0; } .repo-summary { grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px 16px; } .repo-name { grid-column:1 / -1; } .repo-body-head { flex-direction:column; } .repo-group-heading { align-items:flex-start; } .repo-group-title { flex-wrap:wrap; } .namespace-management-panel { width:calc(100vw - 32px); } .namespace-management-form { grid-template-columns:1fr 1fr; } .namespace-management-form button { grid-column:1 / -1; justify-self:start; } }
   </style>
 </head>
 <body data-csrf-token="{{.CSRFToken}}">
@@ -1223,6 +1378,60 @@ const uiTemplateText = `
       });
     })();
     (() => {
+      const fallbackCopy = (value, target) => {
+        const textarea = document.createElement('textarea');
+        textarea.value = value;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        let copied = false;
+        try { copied = document.execCommand('copy'); } catch {}
+        textarea.remove();
+        if (!copied) {
+          const range = document.createRange();
+          range.selectNodeContents(target);
+          const selection = window.getSelection();
+          if (selection) {
+            selection.removeAllRanges();
+            selection.addRange(range);
+          }
+        }
+        return copied;
+      };
+
+      document.querySelectorAll('.digest-cell[data-copy-value]').forEach((cell) => {
+        const initialTitle = cell.title;
+        const initialLabel = cell.getAttribute('aria-label') || initialTitle;
+        const copy = async () => {
+          const value = cell.dataset.copyValue;
+          if (!value) return;
+          let copied = false;
+          try {
+            await navigator.clipboard.writeText(value);
+            copied = true;
+          } catch {
+            copied = fallbackCopy(value, cell);
+          }
+          cell.dataset.copyState = copied ? 'copied' : 'selected';
+          cell.title = copied ? 'Digest copied' : 'Digest selected; copy it manually';
+          cell.setAttribute('aria-label', copied ? 'Digest copied' : 'Digest selected; copy it manually');
+          setTimeout(() => {
+            delete cell.dataset.copyState;
+            cell.title = initialTitle;
+            cell.setAttribute('aria-label', initialLabel);
+          }, 1600);
+        };
+        cell.addEventListener('click', copy);
+        cell.addEventListener('keydown', (event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          event.preventDefault();
+          copy();
+        });
+      });
+    })();
+    (() => {
       const parsers = {
         Tag: (value) => value.toLowerCase(),
         Digest: (value) => value.toLowerCase(),
@@ -1295,7 +1504,21 @@ const uiTemplateText = `
   {{else if eq .Active "repositories"}}
     <div class="page-header"><div><h1 class="page-title">Image Repositories</h1><p class="page-description">Browse pushed images, inspect tags, and remove stale image references.</p></div></div>
     <form class="filters" method="get" action="/ui/repositories"><div class="search"><span class="material-symbols-outlined">search</span><input name="q" value="{{.SearchQuery}}" placeholder="Search repositories, namespaces, tags, or digests" aria-label="Search repositories"></div><button class="small-action" type="submit">Search</button>{{if .SearchQuery}}<a class="secondary-action" href="/ui/repositories">Clear</a>{{end}}</form>
-    <div class="repo-list">{{range .Repos}}<details class="repo-card"><summary><div class="repo-summary"><div class="repo-name">{{if .Namespace}}<span class="repo-namespace">namespace: {{.Namespace}}</span>{{end}}<strong>{{.Repository.Name}}</strong></div><div class="repo-metric"><span>Tags</span><strong>{{.Repository.TagCount}}</strong></div><div class="repo-metric"><span>Manifests</span><strong>{{.Repository.ManifestCount}}</strong></div><div class="repo-metric"><span>Size</span><strong>{{bytes .Repository.SizeBytes}}</strong></div><div class="repo-metric"><span>Last Push</span><strong>{{time .Repository.LastPushAt}}</strong></div></div></summary><div class="repo-body"><div class="repo-body-head"><div><strong>Tag references</strong><p class="muted">Deleting a tag removes only that tag reference. It does not delete the manifest content; untagged manifests can be cleaned by garbage collection when that exists.</p></div><form method="post" action="/ui/repositories/delete" data-confirm-title="Delete image repository {{.Repository.Name}}?" data-confirm-body="This removes all tag references and tagged manifests for this exact image repository only. It does not delete other image repositories that share the same namespace prefix." data-confirm-submit="Delete image repository"><input type="hidden" name="repository" value="{{.Repository.Name}}"><button class="danger-action" type="submit">Delete image repository</button></form></div>{{if .Tags}}<div class="table-scroll tag-table"><table><thead><tr><th>Tag</th><th>Digest</th><th>Media Type</th><th class="numeric">Size</th><th>Pushed</th><th>Pulled</th><th>Action</th></tr></thead><tbody>{{range .Tags}}<tr><td class="tag-name">{{.Tag}}</td><td class="mono" title="{{.Digest}}">{{shortDigest .Digest}}</td><td class="muted">{{.MediaType}}</td><td class="numeric">{{bytes .SizeBytes}}</td><td class="muted">{{timeValue .PushedAt}}</td><td class="muted">{{time .PulledAt}}</td><td><form method="post" action="/ui/repositories/delete-tag" data-confirm-title="Delete tag {{.Tag}}?" data-confirm-body="This removes only the tag reference {{.RepositoryName}}:{{.Tag}}. It does not delete the manifest content or other tags that point at the same digest." data-confirm-submit="Delete tag"><input type="hidden" name="repository" value="{{.RepositoryName}}"><input type="hidden" name="tag" value="{{.Tag}}"><button class="danger-action" type="submit">Delete tag</button></form></td></tr>{{end}}</tbody></table></div>{{else}}<div class="empty-state"><div><strong>No tag references</strong><br><span>This image repository has no tags in the read model.</span></div></div>{{end}}</div></details>{{else}}<div class="table-card"><div class="empty-state"><div><strong>{{if .SearchQuery}}No repositories match this search{{else}}No repositories yet{{end}}</strong><br><span>{{if .SearchQuery}}Try a different repository, namespace, tag, or digest.{{else}}Push an image to populate this page.{{end}}</span></div></div></div>{{end}}</div>
+    <div class="repo-list">
+      {{range .RepoGroups}}
+        <section class="repo-group">
+          <div class="repo-group-heading">
+            <div class="repo-group-title"><h2 class="repo-group-label">{{repositoryGroupLabel .Namespace}}</h2><span class="repo-group-count">{{repositoryCountLabel (len .Repositories)}}</span></div>
+            {{template "namespace-tag-management" .}}
+          </div>
+          <div class="repo-group-rows">
+            {{range .Repositories}}{{template "repository-row" .}}{{end}}
+          </div>
+        </section>
+      {{else}}
+        <div class="table-card"><div class="empty-state"><div><strong>{{if .SearchQuery}}No repositories match this search{{else}}No repositories yet{{end}}</strong><br><span>{{if .SearchQuery}}Try a different repository, namespace, tag, or digest.{{else}}Push an image to populate this page.{{end}}</span></div></div></div>
+      {{end}}
+    </div>
   {{else if eq .Active "users"}}
     <div class="page-header"><div><h1 class="page-title">Users</h1><p class="page-description">Create and manage registry users. Each user signs in directly with the secret shown at creation time.</p></div></div>
     {{if .IssuedUserSecret}}<section class="secret-panel"><h2>User created: {{.IssuedUserSecret.Username}}</h2><p class="muted">Copy this secret now. It is shown once and only the hash is stored.</p><div class="secret-row"><code class="secret" id="issued-secret">{{.IssuedUserSecret.Secret}}</code><button class="copy-secret" type="button" data-copy-target="#issued-secret" title="Copy secret" aria-label="Copy secret"><span class="material-symbols-outlined">content_copy</span></button><span class="copy-status" data-copy-status aria-live="polite"></span></div><div class="secret-actions"><p class="muted">Username: {{.IssuedUserSecret.Username}} · Valid from: {{if .IssuedUserSecret.NotBefore}}{{time .IssuedUserSecret.NotBefore}}{{else}}immediately{{end}} · Expires: {{if .IssuedUserSecret.ExpiresAt}}{{time .IssuedUserSecret.ExpiresAt}}{{else}}never{{end}}</p></div></section>{{end}}
@@ -1327,6 +1550,65 @@ const uiTemplateText = `
     <section class="form-card"><h2 class="form-title">Garbage Collection</h2><form method="post" action="/ui/settings/gc" class="form-grid"><div><label for="gc-enabled">Enabled</label><select id="gc-enabled" name="enabled"><option value="on" {{if .GCSettings.Enabled}}selected{{end}}>Enabled</option><option value="" {{if not .GCSettings.Enabled}}selected{{end}}>Disabled</option></select></div><div><label for="gc-delay">Delete untagged manifests after</label><input id="gc-delay" name="delay" value="{{duration .GCSettings.Delay}}" required></div><div><label for="gc-interval">Run interval</label><input id="gc-interval" name="interval" value="{{duration .GCSettings.Interval}}" required></div><button class="primary-action" type="submit">Save GC Settings</button></form><p class="muted">GC only removes untagged manifest records after the grace period. Blob/layer cleanup is intentionally not enabled yet because blobs can be shared across manifests.</p></section>
     <section class="form-card"><h2 class="form-title">Registry Webhook</h2><form method="post" action="/ui/settings/webhook" class="form-grid"><div style="grid-column:1 / -2"><label for="registry-webhook-url">Webhook URL</label><input id="registry-webhook-url" name="url" type="url" value="{{.RegistryWebhook.URL}}" placeholder="https://example.com/scr-events"></div><button class="primary-action" type="submit">Save Webhook</button></form><p class="muted">When configured, SCR sends best-effort JSON POST events for registry pull, push, and delete activity, including repository deletes from this UI. Leave the URL empty to disable delivery.</p></section>
   {{end}}
+{{end}}
+
+{{define "namespace-tag-management"}}
+  <details class="namespace-management">
+    <summary class="small-action"><span class="material-symbols-outlined">label</span>Manage tags</summary>
+    <div class="namespace-management-panel">
+      <div class="namespace-management-head"><strong>Tag management</strong><span>Add a tag to an existing manifest or set overwrite protection for this namespace.</span></div>
+      <div class="namespace-management-list">
+        {{range .Repositories}}
+          <div class="namespace-management-row">
+            <div class="namespace-management-repo"><strong class="mono">{{.Repository.Name}}</strong><span class="badge active">{{if eq .Policy.Mode "mutable"}}Mutable{{else if eq .Policy.Mode "immutable"}}Protected{{else}}Pattern protected{{end}}</span></div>
+            <div class="namespace-management-forms">
+              <form method="post" action="/ui/repositories/add-tag" class="namespace-management-form">
+                <input type="hidden" name="repository" value="{{.Repository.Name}}">
+                <div><label>New tag</label><input name="tag" placeholder="stable" required></div>
+                <div><label>Manifest digest</label><input name="digest" placeholder="sha256:..." required></div>
+                <button class="primary-action" type="submit">Add tag</button>
+              </form>
+              <form method="post" action="/ui/repositories/tag-policy" class="namespace-management-form">
+                <input type="hidden" name="repository" value="{{.Repository.Name}}">
+                <div><label>Overwrite policy</label><select name="mode"><option value="mutable" {{if eq .Policy.Mode "mutable"}}selected{{end}}>All tags mutable</option><option value="immutable" {{if eq .Policy.Mode "immutable"}}selected{{end}}>All tags protected</option><option value="pattern" {{if eq .Policy.Mode "pattern"}}selected{{end}}>Protect matching tags</option></select></div>
+                <div><label>Protected tag pattern</label><input name="pattern" value="{{.Policy.Pattern}}" placeholder="^v[0-9].*"></div>
+                <button class="secondary-action" type="submit">Save policy</button>
+              </form>
+            </div>
+          </div>
+        {{end}}
+      </div>
+    </div>
+  </details>
+{{end}}
+
+{{define "repository-row"}}
+  <details class="repo-card">
+    <summary aria-label="Open repository {{.Repository.Name}}">
+      <div class="repo-summary">
+        <div class="repo-name"><div class="repo-name-line"><span class="material-symbols-outlined repo-expand" aria-hidden="true">chevron_right</span><strong title="{{.Repository.Name}}">{{.Name}}</strong></div></div>
+        <div class="repo-metric"><span>Tags</span><strong>{{.Repository.TagCount}}</strong></div>
+        <div class="repo-metric"><span>Manifests</span><strong>{{.Repository.ManifestCount}}</strong></div>
+        <div class="repo-metric"><span>Size</span><strong>{{bytes .Repository.SizeBytes}}</strong></div>
+        <div class="repo-metric"><span>Last Push</span><strong>{{time .Repository.LastPushAt}}</strong></div>
+      </div>
+    </summary>
+    <div class="repo-body">
+      <div class="repo-body-head">
+        <div><strong class="repo-expanded-name">{{.Repository.Name}}</strong><strong class="repo-section-label">Tag references</strong><p class="muted">Deleting a tag removes only that tag reference. It does not delete the manifest content; untagged manifests can be cleaned by garbage collection when that exists.</p></div>
+        <form method="post" action="/ui/repositories/delete" data-confirm-title="Delete image repository {{.Repository.Name}}?" data-confirm-body="This removes all tag references and tagged manifests for this exact image repository only. It does not delete other image repositories that share the same namespace prefix." data-confirm-submit="Delete image repository"><input type="hidden" name="repository" value="{{.Repository.Name}}"><button class="danger-action" type="submit">Delete image repository</button></form>
+      </div>
+      {{if .Tags}}
+        <div class="table-scroll tag-table">
+          <table><thead><tr><th>Tag</th><th>Digest</th><th>Media Type</th><th class="numeric">Size</th><th>Pushed</th><th>Pulled</th><th>Action</th></tr></thead><tbody>
+            {{range .Tags}}<tr><td class="tag-name">{{.Tag}}</td><td class="mono digest-cell" data-copy-value="{{.Digest}}" role="button" tabindex="0" title="Copy digest {{.Digest}}" aria-label="Copy digest {{.Digest}}">{{shortDigest .Digest}}</td><td class="muted">{{.MediaType}}</td><td class="numeric">{{bytes .SizeBytes}}</td><td class="muted">{{timeValue .PushedAt}}</td><td class="muted">{{time .PulledAt}}</td><td><form method="post" action="/ui/repositories/delete-tag" data-confirm-title="Delete tag {{.Tag}}?" data-confirm-body="This removes only the tag reference {{.RepositoryName}}:{{.Tag}}. It does not delete the manifest content or other tags that point at the same digest." data-confirm-submit="Delete tag"><input type="hidden" name="repository" value="{{.RepositoryName}}"><input type="hidden" name="tag" value="{{.Tag}}"><button class="danger-action" type="submit">Delete tag</button></form></td></tr>{{end}}
+          </tbody></table>
+        </div>
+      {{else}}
+        <div class="empty-state"><div><strong>No tag references</strong><br><span>This image repository has no tags in the read model.</span></div></div>
+      {{end}}
+    </div>
+  </details>
 {{end}}
 
 {{define "repositories"}}{{template "shell" .}}{{end}}

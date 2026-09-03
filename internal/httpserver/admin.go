@@ -9,6 +9,7 @@ import (
 
 	"simplecontainerregistry/internal/db"
 	"simplecontainerregistry/internal/domain"
+	"simplecontainerregistry/internal/storage"
 )
 
 type createUserRequest struct {
@@ -32,6 +33,16 @@ type createGrantRequest struct {
 	SubjectID        string          `json:"subjectId"`
 	RepositoryPrefix string          `json:"repositoryPrefix"`
 	Actions          []domain.Action `json:"actions"`
+}
+
+type createRepositoryTagRequest struct {
+	Tag    string `json:"tag"`
+	Digest string `json:"digest"`
+}
+
+type updateRepositoryTagPolicyRequest struct {
+	Mode    domain.TagPolicyMode `json:"mode"`
+	Pattern string               `json:"pattern"`
 }
 
 func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
@@ -216,11 +227,55 @@ func (s *Server) handleRepositoryRoute(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
-	if strings.HasSuffix(name, "/tags") {
-		s.handleListRepositoryTags(w, r, strings.TrimSuffix(name, "/tags"))
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	s.handleGetRepository(w, r, name)
+	if _, err := s.store.GetRepository(r.Context(), name); err == nil {
+		s.handleGetRepository(w, r, name)
+		return
+	} else if !errors.Is(err, db.ErrNotFound) {
+		writeStoreError(w, err)
+		return
+	}
+	if strings.HasSuffix(name, "/tags") {
+		repositoryName := strings.TrimSuffix(name, "/tags")
+		s.handleListRepositoryTags(w, r, repositoryName)
+		return
+	}
+	writeStoreError(w, db.ErrNotFound)
+}
+
+func (s *Server) handleRepositoryTagsRoute(w http.ResponseWriter, r *http.Request) {
+	repositoryName := strings.Trim(r.PathValue("name"), "/")
+	if repositoryName == "" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		s.handleListRepositoryTags(w, r, repositoryName)
+	case http.MethodPost:
+		s.handleCreateRepositoryTag(w, r, repositoryName)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *Server) handleRepositoryTagPolicyRoute(w http.ResponseWriter, r *http.Request) {
+	repositoryName := strings.Trim(r.PathValue("name"), "/")
+	if repositoryName == "" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		s.handleGetRepositoryTagPolicy(w, r, repositoryName)
+	case http.MethodPut:
+		s.handleUpdateRepositoryTagPolicy(w, r, repositoryName)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
 func (s *Server) handleGetRepository(w http.ResponseWriter, r *http.Request, name string) {
@@ -247,6 +302,100 @@ func (s *Server) handleListRepositoryTags(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, tags)
+}
+
+func (s *Server) handleCreateRepositoryTag(w http.ResponseWriter, r *http.Request, repositoryName string) {
+	var request createRepositoryTagRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	request.Tag = strings.TrimSpace(request.Tag)
+	request.Digest = strings.TrimSpace(request.Digest)
+	if request.Tag == "" || request.Digest == "" {
+		writeError(w, http.StatusBadRequest, "tag and digest are required")
+		return
+	}
+	if err := storage.ValidateRepository(repositoryName); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := storage.ValidateTag(request.Tag); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := storage.ValidateDigest(request.Digest); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	tag, err := s.addRepositoryTag(r.Context(), repositoryName, request.Tag, request.Digest, time.Now().UTC())
+	if err != nil {
+		writeManifestMutationError(w, err)
+		return
+	}
+	if err := s.store.IncrementUsageCounter(r.Context(), repositoryName, domain.ActionPush, time.Now().UTC()); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update usage counters")
+		return
+	}
+	if err := s.audit(r, "registry.manifest.tagged", "repository", repositoryName, "success"); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to write audit event")
+		return
+	}
+	writeJSON(w, http.StatusCreated, tag)
+}
+
+func (s *Server) handleGetRepositoryTagPolicy(w http.ResponseWriter, r *http.Request, repositoryName string) {
+	if err := storage.ValidateRepository(repositoryName); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if _, err := s.store.GetRepository(r.Context(), repositoryName); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	policy, err := s.store.GetRepositoryTagPolicy(r.Context(), repositoryName)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load repository tag policy")
+		return
+	}
+	writeJSON(w, http.StatusOK, policy)
+}
+
+func (s *Server) handleUpdateRepositoryTagPolicy(w http.ResponseWriter, r *http.Request, repositoryName string) {
+	var request updateRepositoryTagPolicyRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := storage.ValidateRepository(repositoryName); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var policy domain.RepositoryTagPolicy
+	err := s.withTagMutationLock(repositoryName, func() error {
+		var err error
+		policy, err = s.store.UpdateRepositoryTagPolicy(r.Context(), domain.RepositoryTagPolicy{
+			RepositoryName: repositoryName,
+			Mode:           request.Mode,
+			Pattern:        strings.TrimSpace(request.Pattern),
+		}, time.Now().UTC())
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.audit(r, "repository.tag_policy.updated", "repository", repositoryName, "success"); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to write audit event")
+		return
+	}
+	writeJSON(w, http.StatusOK, policy)
 }
 
 func (s *Server) handleListAuditEvents(w http.ResponseWriter, r *http.Request) {

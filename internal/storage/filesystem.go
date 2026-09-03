@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -89,6 +90,24 @@ func (fs Filesystem) ManifestPath(repository, reference string) (string, error) 
 }
 
 func (fs Filesystem) PutManifest(repository, reference, mediaType string, content []byte) (string, int64, error) {
+	digest, size, err := fs.PutManifestContent(repository, reference, mediaType, content)
+	if err != nil {
+		return "", 0, err
+	}
+	if !strings.Contains(reference, ":") {
+		repoPath, err := safeRepositoryPath(repository)
+		if err != nil {
+			return "", 0, err
+		}
+		if err := fs.linkManifestTag(repoPath, reference, digest); err != nil {
+			return "", 0, err
+		}
+	}
+	return digest, size, nil
+}
+
+// PutManifestContent stores a manifest without creating a tag reference.
+func (fs Filesystem) PutManifestContent(repository, reference, mediaType string, content []byte) (string, int64, error) {
 	repoPath, err := safeRepositoryPath(repository)
 	if err != nil {
 		return "", 0, err
@@ -118,13 +137,56 @@ func (fs Filesystem) PutManifest(repository, reference, mediaType string, conten
 	if err := os.WriteFile(filepath.Join(digestPath, "mediaType"), []byte(mediaType), 0o640); err != nil {
 		return "", 0, err
 	}
-
-	if !strings.Contains(reference, ":") {
-		if err := fs.linkManifestTag(repoPath, reference, digest); err != nil {
-			return "", 0, err
-		}
-	}
 	return digest, int64(len(content)), nil
+}
+
+// ManifestTagDigest returns the digest currently referenced by a tag.
+func (fs Filesystem) ManifestTagDigest(repository, tag string) (string, error) {
+	repoPath, err := safeRepositoryPath(repository)
+	if err != nil {
+		return "", err
+	}
+	tagPathName, err := sanitizeReference(tag)
+	if err != nil {
+		return "", err
+	}
+	tagPath := fs.safeJoin("repositories", repoPath, "tags", tagPathName)
+	data, err := os.ReadFile(tagPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	digest := strings.TrimSpace(string(data))
+	if _, _, err := parseDigest(digest); err != nil {
+		return "", err
+	}
+	return digest, nil
+}
+
+func (fs Filesystem) WithRepositoryLock(repository string, fn func() error) error {
+	repoPath, err := safeRepositoryPath(repository)
+	if err != nil {
+		return err
+	}
+	if fn == nil {
+		return fmt.Errorf("repository lock callback is required")
+	}
+	lockDirectory := fs.safeJoin("repositories", repoPath)
+	if err := os.MkdirAll(lockDirectory, 0o750); err != nil {
+		return err
+	}
+	lockFile, err := os.OpenFile(filepath.Join(lockDirectory, ".tag.lock"), os.O_CREATE|os.O_RDWR, 0o640)
+	if err != nil {
+		return err
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	return fn()
 }
 
 func (fs Filesystem) LinkManifestTag(repository, tag, digest string) error {
@@ -152,19 +214,10 @@ func (fs Filesystem) GetManifest(repository, reference string) ([]byte, string, 
 	}
 	digest := reference
 	if !strings.Contains(reference, ":") {
-		tag, err := sanitizeReference(reference)
+		digest, err = fs.ManifestTagDigest(repository, reference)
 		if err != nil {
 			return nil, "", "", err
 		}
-		tagPath := fs.safeJoin("repositories", repoPath, "tags", tag)
-		data, err := os.ReadFile(tagPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil, "", "", ErrNotFound
-			}
-			return nil, "", "", err
-		}
-		digest = strings.TrimSpace(string(data))
 	}
 	digestPath, err := fs.manifestDigestPath(repoPath, digest)
 	if err != nil {
@@ -194,19 +247,15 @@ func (fs Filesystem) DeleteManifest(repository, reference string) (string, error
 	}
 	digest := reference
 	if !strings.Contains(reference, ":") {
+		digest, err = fs.ManifestTagDigest(repository, reference)
+		if err != nil {
+			return "", err
+		}
 		tag, err := sanitizeReference(reference)
 		if err != nil {
 			return "", err
 		}
 		tagPath := fs.safeJoin("repositories", repoPath, "tags", tag)
-		data, err := os.ReadFile(tagPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return "", ErrNotFound
-			}
-			return "", err
-		}
-		digest = strings.TrimSpace(string(data))
 		if err := os.Remove(tagPath); err != nil && !os.IsNotExist(err) {
 			return "", err
 		}
@@ -532,44 +581,49 @@ func (fs Filesystem) CollectGarbage(cutoff time.Time) (GCResult, error) {
 		if err != nil {
 			return err
 		}
-		referenced, err := fs.referencedManifestDigests(repoPath)
-		if err != nil {
-			return err
-		}
-		algorithmDirs, err := os.ReadDir(path)
-		if err != nil {
-			return err
-		}
-		for _, algorithmDir := range algorithmDirs {
-			if !algorithmDir.IsDir() {
-				continue
-			}
-			digestRoot := filepath.Join(path, algorithmDir.Name())
-			digestDirs, err := os.ReadDir(digestRoot)
+		if err := fs.WithRepositoryLock(repoPath, func() error {
+			referenced, err := fs.referencedManifestDigests(repoPath)
 			if err != nil {
 				return err
 			}
-			for _, digestDir := range digestDirs {
-				if !digestDir.IsDir() {
+			algorithmDirs, err := os.ReadDir(path)
+			if err != nil {
+				return err
+			}
+			for _, algorithmDir := range algorithmDirs {
+				if !algorithmDir.IsDir() {
 					continue
 				}
-				digest := algorithmDir.Name() + ":" + digestDir.Name()
-				if referenced[digest] {
-					continue
-				}
-				digestPath := filepath.Join(digestRoot, digestDir.Name())
-				info, err := digestDir.Info()
+				digestRoot := filepath.Join(path, algorithmDir.Name())
+				digestDirs, err := os.ReadDir(digestRoot)
 				if err != nil {
 					return err
 				}
-				if info.ModTime().After(cutoff) {
-					continue
+				for _, digestDir := range digestDirs {
+					if !digestDir.IsDir() {
+						continue
+					}
+					digest := algorithmDir.Name() + ":" + digestDir.Name()
+					if referenced[digest] {
+						continue
+					}
+					digestPath := filepath.Join(digestRoot, digestDir.Name())
+					info, err := digestDir.Info()
+					if err != nil {
+						return err
+					}
+					if info.ModTime().After(cutoff) {
+						continue
+					}
+					if err := os.RemoveAll(digestPath); err != nil {
+						return err
+					}
+					result.DeletedManifests++
 				}
-				if err := os.RemoveAll(digestPath); err != nil {
-					return err
-				}
-				result.DeletedManifests++
 			}
+			return nil
+		}); err != nil {
+			return err
 		}
 		return filepath.SkipDir
 	})
@@ -648,7 +702,24 @@ func (fs Filesystem) linkManifestTag(repoPath, tag, digest string) error {
 	if err := os.MkdirAll(filepath.Dir(tagPath), 0o750); err != nil {
 		return err
 	}
-	return os.WriteFile(tagPath, []byte(digest), 0o640)
+	temporary, err := os.CreateTemp(filepath.Dir(tagPath), ".tag-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o640); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.WriteString(digest); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, tagPath)
 }
 
 func parseDigest(digest string) (string, string, error) {
@@ -823,6 +894,16 @@ func safeRepositoryPath(repository string) (string, error) {
 	return repository, nil
 }
 
+func ValidateRepository(repository string) error {
+	_, err := safeRepositoryPath(repository)
+	return err
+}
+
+func ValidateDigest(digest string) error {
+	_, _, err := parseDigest(digest)
+	return err
+}
+
 func sanitizeReference(reference string) (string, error) {
 	if reference == "" || strings.Contains(reference, "/") || strings.Contains(reference, `\`) || strings.Contains(reference, "..") {
 		return "", fmt.Errorf("%w: %q", ErrInvalidReference, reference)
@@ -834,4 +915,9 @@ func sanitizeReference(reference string) (string, error) {
 		return "", fmt.Errorf("%w: %q", ErrInvalidReference, reference)
 	}
 	return reference, nil
+}
+
+func ValidateTag(tag string) error {
+	_, err := sanitizeReference(tag)
+	return err
 }

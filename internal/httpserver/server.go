@@ -11,8 +11,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"simplecontainerregistry/internal/auth"
@@ -38,8 +40,11 @@ type Server struct {
 	registryFS storage.Filesystem
 	webhooks   *registryWebhookDispatcher
 	authLimits *authAttemptLimiter
+	tagMu      sync.Mutex
 	mux        *http.ServeMux
 }
+
+var ErrTagOverwriteProtected = errors.New("tag overwrite protected")
 
 func New(opts Options) http.Handler {
 	registryFS, err := storage.NewFilesystem(opts.Config.Storage.RootDirectory)
@@ -83,6 +88,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /ui/repositories", s.requireUIAdmin(s.handleUIRepositories))
 	s.mux.HandleFunc("POST /ui/repositories/delete", s.requireUIAdminMutation(s.handleUIRepositoryDelete))
 	s.mux.HandleFunc("POST /ui/repositories/delete-tag", s.requireUIAdminMutation(s.handleUIRepositoryTagDelete))
+	s.mux.HandleFunc("POST /ui/repositories/add-tag", s.requireUIAdminMutation(s.handleUIRepositoryTagAdd))
+	s.mux.HandleFunc("POST /ui/repositories/tag-policy", s.requireUIAdminMutation(s.handleUIRepositoryTagPolicyUpdate))
 	s.mux.HandleFunc("GET /ui/users", s.requireUIAdmin(s.handleUIUsers))
 	s.mux.HandleFunc("POST /ui/users", s.requireUIAdminMutation(s.handleUIUsersCreate))
 	s.mux.HandleFunc("POST /ui/users/{id}/access", s.requireUIAdminMutation(s.handleUIUserAccessUpdate))
@@ -107,6 +114,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/dashboard/summary", s.requireAdmin(s.handleDashboardSummary))
 	s.mux.HandleFunc("GET /api/repositories", s.requireAdmin(s.handleListRepositories))
 	s.mux.HandleFunc("GET /api/repositories/{name...}", s.requireAdmin(s.handleRepositoryRoute))
+	s.mux.HandleFunc("GET /api/repository-tags/{name...}", s.requireAdmin(s.handleRepositoryTagsRoute))
+	s.mux.HandleFunc("POST /api/repository-tags/{name...}", s.requireAdmin(s.handleRepositoryTagsRoute))
+	s.mux.HandleFunc("GET /api/repository-tag-policies/{name...}", s.requireAdmin(s.handleRepositoryTagPolicyRoute))
+	s.mux.HandleFunc("PUT /api/repository-tag-policies/{name...}", s.requireAdmin(s.handleRepositoryTagPolicyRoute))
 	s.mux.HandleFunc("GET /api/audit-events", s.requireAdmin(s.handleListAuditEvents))
 
 	s.mux.HandleFunc("GET /v2/{$}", s.handleV2Base)
@@ -523,6 +534,13 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request, route re
 		if mediaType == "" {
 			mediaType = "application/vnd.oci.image.manifest.v1+json"
 		}
+		tags := manifestTags(route.reference, r.URL.Query()["tag"])
+		for _, tag := range tags {
+			if err := storage.ValidateTag(tag); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
 		for _, digest := range storage.ManifestBlobDigests(content) {
 			linked, err := s.registryFS.HasRepositoryBlob(route.repository, digest)
 			if err != nil {
@@ -534,29 +552,14 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request, route re
 				return
 			}
 		}
-		digest, _, err := s.registryFS.PutManifest(route.repository, route.reference, mediaType, content)
+		digest, err := s.putManifestAndTags(r.Context(), route.repository, route.reference, mediaType, content, tags, time.Now().UTC())
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			writeManifestMutationError(w, err)
 			return
 		}
-		tags := manifestTags(route.reference, r.URL.Query()["tag"])
-		for _, tag := range tags {
-			w.Header().Add("OCI-Tag", tag)
-			if strings.Contains(route.reference, ":") {
-				if err := s.registryFS.LinkManifestTag(route.repository, tag, digest); err != nil {
-					writeStorageError(w, err)
-					return
-				}
-			}
-			if err := s.store.UpsertRepositoryTag(r.Context(), db.UpsertRepositoryTagParams{
-				RepositoryName: route.repository,
-				Tag:            tag,
-				Digest:         digest,
-				MediaType:      mediaType,
-				SizeBytes:      estimateManifestArtifactSize(content),
-			}, time.Now().UTC()); err != nil {
-				writeError(w, http.StatusInternalServerError, "failed to update repository metadata")
-				return
+		if len(tags) > 0 {
+			for _, tag := range tags {
+				w.Header().Add("OCI-Tag", tag)
 			}
 		}
 		if err := s.store.IncrementUsageCounter(r.Context(), route.repository, domain.ActionPush, time.Now().UTC()); err != nil {
@@ -593,11 +596,166 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request, route re
 }
 
 func (s *Server) deleteManifestReference(ctx context.Context, repository, reference string) error {
+	return s.withTagMutationLock(repository, func() error {
+		return s.deleteManifestReferenceLocked(ctx, repository, reference)
+	})
+}
+
+func (s *Server) withTagMutationLock(repository string, fn func() error) error {
+	s.tagMu.Lock()
+	defer s.tagMu.Unlock()
+	return s.registryFS.WithRepositoryLock(repository, fn)
+}
+
+func (s *Server) deleteManifestReferenceLocked(ctx context.Context, repository, reference string) error {
 	digest, err := s.registryFS.DeleteManifest(repository, reference)
 	if err != nil {
 		return err
 	}
 	return s.store.DeleteRepositoryManifestReference(ctx, repository, reference, digest)
+}
+
+type manifestTagState struct {
+	tag    string
+	digest string
+	exists bool
+}
+
+func (s *Server) putManifestAndTags(ctx context.Context, repository, reference, mediaType string, content []byte, tags []string, now time.Time) (string, error) {
+	var digest string
+	err := s.withTagMutationLock(repository, func() error {
+		var err error
+		digest, _, err = s.registryFS.PutManifestContent(repository, reference, mediaType, content)
+		if err != nil {
+			return err
+		}
+		if len(tags) == 0 {
+			return nil
+		}
+		return s.linkManifestTagsLocked(ctx, repository, digest, mediaType, estimateManifestArtifactSize(content), tags, now)
+	})
+	return digest, err
+}
+
+func (s *Server) addRepositoryTag(ctx context.Context, repository, tag, requestedDigest string, now time.Time) (domain.RepositoryTag, error) {
+	if err := storage.ValidateRepository(repository); err != nil {
+		return domain.RepositoryTag{}, err
+	}
+	if err := storage.ValidateTag(tag); err != nil {
+		return domain.RepositoryTag{}, err
+	}
+	if err := storage.ValidateDigest(requestedDigest); err != nil {
+		return domain.RepositoryTag{}, err
+	}
+	var tagMetadata domain.RepositoryTag
+	err := s.withTagMutationLock(repository, func() error {
+		content, mediaType, digest, err := s.registryFS.GetManifest(repository, requestedDigest)
+		if err != nil {
+			return err
+		}
+		if err := s.linkManifestTagsLocked(ctx, repository, digest, mediaType, estimateManifestArtifactSize(content), []string{tag}, now); err != nil {
+			return err
+		}
+		tagMetadata, err = s.store.GetRepositoryTag(ctx, repository, tag)
+		return err
+	})
+	return tagMetadata, err
+}
+
+func (s *Server) linkManifestTagsLocked(ctx context.Context, repository, digest, mediaType string, sizeBytes int64, tags []string, now time.Time) error {
+	policy, err := s.store.GetRepositoryTagPolicy(ctx, repository)
+	if err != nil {
+		return err
+	}
+	protectedPattern, err := tagPolicyPattern(policy)
+	if err != nil {
+		return err
+	}
+
+	states := make([]manifestTagState, 0, len(tags))
+	for _, tag := range tags {
+		if err := storage.ValidateTag(tag); err != nil {
+			return err
+		}
+		currentDigest, err := s.registryFS.ManifestTagDigest(repository, tag)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return err
+		}
+		state := manifestTagState{tag: tag}
+		if err == nil {
+			state.exists = true
+			state.digest = currentDigest
+		}
+		if state.exists && state.digest != digest && tagPolicyProtects(policy, protectedPattern, tag) {
+			return fmt.Errorf("%w: %s", ErrTagOverwriteProtected, tag)
+		}
+		states = append(states, state)
+	}
+
+	params := make([]db.UpsertRepositoryTagParams, 0, len(states))
+	for _, state := range states {
+		params = append(params, db.UpsertRepositoryTagParams{
+			RepositoryName: repository,
+			Tag:            state.tag,
+			Digest:         digest,
+			MediaType:      mediaType,
+			SizeBytes:      sizeBytes,
+		})
+	}
+	for index, state := range states {
+		if err := s.registryFS.LinkManifestTag(repository, state.tag, digest); err != nil {
+			if rollbackErr := s.rollbackManifestTags(repository, states[:index]); rollbackErr != nil {
+				return errors.Join(err, rollbackErr)
+			}
+			return err
+		}
+	}
+	if err := s.store.UpsertRepositoryTags(ctx, params, now); err != nil {
+		if rollbackErr := s.rollbackManifestTags(repository, states); rollbackErr != nil {
+			return errors.Join(err, rollbackErr)
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Server) rollbackManifestTags(repository string, states []manifestTagState) error {
+	var rollbackErr error
+	for index := len(states) - 1; index >= 0; index-- {
+		state := states[index]
+		if state.exists {
+			if err := s.registryFS.LinkManifestTag(repository, state.tag, state.digest); err != nil {
+				rollbackErr = errors.Join(rollbackErr, err)
+			}
+		} else {
+			if _, err := s.registryFS.DeleteManifest(repository, state.tag); err != nil && !errors.Is(err, storage.ErrNotFound) {
+				rollbackErr = errors.Join(rollbackErr, err)
+			}
+		}
+	}
+	return rollbackErr
+}
+
+func tagPolicyPattern(policy domain.RepositoryTagPolicy) (*regexp.Regexp, error) {
+	if policy.Mode != domain.TagPolicyPattern {
+		return nil, nil
+	}
+	pattern, err := regexp.Compile(policy.Pattern)
+	if err != nil {
+		return nil, fmt.Errorf("invalid tag policy pattern: %w", err)
+	}
+	return pattern, nil
+}
+
+func tagPolicyProtects(policy domain.RepositoryTagPolicy, pattern *regexp.Regexp, tag string) bool {
+	switch policy.Mode {
+	case domain.TagPolicyImmutable:
+		return true
+	case domain.TagPolicyPattern:
+		return pattern != nil && pattern.MatchString(tag)
+	default:
+		return false
+	}
 }
 
 func (s *Server) handleTags(w http.ResponseWriter, r *http.Request, route registryRoute) {
@@ -892,6 +1050,22 @@ func writeStorageError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusInternalServerError, "storage error")
+}
+
+func writeManifestMutationError(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrTagOverwriteProtected) {
+		writeError(w, http.StatusConflict, "tag is protected from overwrite")
+		return
+	}
+	if errors.Is(err, storage.ErrInvalidDigest) || errors.Is(err, storage.ErrInvalidReference) {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if errors.Is(err, storage.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "failed to update repository metadata")
 }
 
 func parseNonNegativeInt(raw string) (int, error) {

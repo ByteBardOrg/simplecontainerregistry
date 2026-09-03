@@ -153,6 +153,8 @@ func registryWebhookGroup(action string) (string, bool) {
 		return "registry.pull", true
 	case strings.HasPrefix(action, "registry.") && strings.HasSuffix(action, ".pushed"):
 		return "registry.push", true
+	case strings.HasPrefix(action, "registry.") && strings.HasSuffix(action, ".tagged"):
+		return "registry.push", true
 	case strings.HasPrefix(action, "registry.") && strings.HasSuffix(action, ".deleted"):
 		return "registry.delete", true
 	default:

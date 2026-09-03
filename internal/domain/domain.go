@@ -69,6 +69,30 @@ type RepositoryTag struct {
 	PulledAt       *time.Time `json:"pulledAt,omitempty"`
 }
 
+type TagPolicyMode string
+
+const (
+	TagPolicyMutable   TagPolicyMode = "mutable"
+	TagPolicyImmutable TagPolicyMode = "immutable"
+	TagPolicyPattern   TagPolicyMode = "pattern"
+)
+
+func ValidTagPolicyMode(mode TagPolicyMode) bool {
+	switch mode {
+	case TagPolicyMutable, TagPolicyImmutable, TagPolicyPattern:
+		return true
+	default:
+		return false
+	}
+}
+
+type RepositoryTagPolicy struct {
+	RepositoryName string        `json:"repositoryName"`
+	Mode           TagPolicyMode `json:"mode"`
+	Pattern        string        `json:"pattern,omitempty"`
+	UpdatedAt      *time.Time    `json:"updatedAt,omitempty"`
+}
+
 type DashboardSummary struct {
 	Repositories      int   `json:"repositories"`
 	Tags              int   `json:"tags"`

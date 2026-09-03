@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -53,6 +54,8 @@ const (
 	settingGCInterval         = "gc.interval"
 	settingRegistryWebhookURL = "webhook.registry_url"
 )
+
+var defaultRepositoryTagPolicy = domain.RepositoryTagPolicy{Mode: domain.TagPolicyMutable}
 
 func Open(ctx context.Context, dsn string) (*Store, error) {
 	database, err := sql.Open("sqlite", dsn)
@@ -277,11 +280,24 @@ func (s *Store) DeleteGrant(ctx context.Context, id string) error {
 }
 
 func (s *Store) UpsertRepositoryTag(ctx context.Context, params UpsertRepositoryTagParams, now time.Time) error {
-	if params.RepositoryName == "" || params.Tag == "" || params.Digest == "" {
-		return fmt.Errorf("repository name, tag, and digest are required")
+	return s.UpsertRepositoryTags(ctx, []UpsertRepositoryTagParams{params}, now)
+}
+
+func (s *Store) UpsertRepositoryTags(ctx context.Context, params []UpsertRepositoryTagParams, now time.Time) error {
+	if len(params) == 0 {
+		return nil
 	}
-	if params.SizeBytes < 0 {
-		return fmt.Errorf("size bytes cannot be negative")
+	repositoryName := params[0].RepositoryName
+	if repositoryName == "" {
+		return fmt.Errorf("repository name is required")
+	}
+	for _, param := range params {
+		if param.RepositoryName != repositoryName || param.Tag == "" || param.Digest == "" {
+			return fmt.Errorf("repository name, tag, and digest are required")
+		}
+		if param.SizeBytes < 0 {
+			return fmt.Errorf("size bytes cannot be negative")
+		}
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -293,37 +309,118 @@ func (s *Store) UpsertRepositoryTag(ctx context.Context, params UpsertRepository
 		INSERT INTO repositories (name, last_push_at)
 		VALUES (?, ?)
 		ON CONFLICT(name) DO UPDATE SET last_push_at = excluded.last_push_at`,
-		params.RepositoryName, now,
+		repositoryName, now,
 	); err != nil {
 		return err
 	}
 
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO repository_tags (repository_name, tag, digest, media_type, size_bytes, pushed_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(repository_name, tag) DO UPDATE SET
-		  digest = excluded.digest,
-		  media_type = excluded.media_type,
-		  size_bytes = excluded.size_bytes,
-		  pushed_at = excluded.pushed_at`,
-		params.RepositoryName, params.Tag, params.Digest, params.MediaType, params.SizeBytes, now,
-	); err != nil {
-		return err
+	for _, param := range params {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO repository_tags (repository_name, tag, digest, media_type, size_bytes, pushed_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(repository_name, tag) DO UPDATE SET
+			  digest = excluded.digest,
+			  media_type = excluded.media_type,
+			  size_bytes = excluded.size_bytes,
+			  pushed_at = excluded.pushed_at,
+			  pulled_at = CASE WHEN repository_tags.digest = excluded.digest THEN repository_tags.pulled_at ELSE NULL END`,
+			param.RepositoryName, param.Tag, param.Digest, param.MediaType, param.SizeBytes, now,
+		); err != nil {
+			return err
+		}
 	}
 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE repositories SET
 		  tag_count = (SELECT COUNT(*) FROM repository_tags WHERE repository_name = ?),
 		  manifest_count = (SELECT COUNT(DISTINCT digest) FROM repository_tags WHERE repository_name = ?),
-		  size_bytes = COALESCE((SELECT SUM(size_bytes) FROM repository_tags WHERE repository_name = ?), 0),
+		  size_bytes = COALESCE((SELECT SUM(size_bytes) FROM (SELECT digest, MAX(size_bytes) AS size_bytes FROM repository_tags WHERE repository_name = ? GROUP BY digest)), 0),
 		  last_push_at = ?
 		WHERE name = ?`,
-		params.RepositoryName, params.RepositoryName, params.RepositoryName, now, params.RepositoryName,
+		repositoryName, repositoryName, repositoryName, now, repositoryName,
 	); err != nil {
 		return err
 	}
 
 	return tx.Commit()
+}
+
+func (s *Store) GetRepositoryTag(ctx context.Context, repositoryName, tag string) (domain.RepositoryTag, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT repository_name, tag, digest, media_type, size_bytes, pushed_at, pulled_at
+		FROM repository_tags WHERE repository_name = ? AND tag = ?`, repositoryName, tag)
+	var repositoryTag domain.RepositoryTag
+	if err := row.Scan(&repositoryTag.RepositoryName, &repositoryTag.Tag, &repositoryTag.Digest, &repositoryTag.MediaType, &repositoryTag.SizeBytes, &repositoryTag.PushedAt, &repositoryTag.PulledAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.RepositoryTag{}, ErrNotFound
+		}
+		return domain.RepositoryTag{}, err
+	}
+	return repositoryTag, nil
+}
+
+func (s *Store) GetRepositoryTagPolicy(ctx context.Context, repositoryName string) (domain.RepositoryTagPolicy, error) {
+	if repositoryName == "" {
+		return domain.RepositoryTagPolicy{}, fmt.Errorf("repository name is required")
+	}
+	var repositoryExists bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM repositories WHERE name = ?)`, repositoryName).Scan(&repositoryExists); err != nil {
+		return domain.RepositoryTagPolicy{}, err
+	}
+	if !repositoryExists {
+		policy := defaultRepositoryTagPolicy
+		policy.RepositoryName = repositoryName
+		return policy, nil
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT repository_name, mode, pattern, updated_at
+		FROM repository_tag_policies WHERE repository_name = ?`, repositoryName)
+	var policy domain.RepositoryTagPolicy
+	var updatedAt time.Time
+	if err := row.Scan(&policy.RepositoryName, &policy.Mode, &policy.Pattern, &updatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			policy = defaultRepositoryTagPolicy
+			policy.RepositoryName = repositoryName
+			return policy, nil
+		}
+		return domain.RepositoryTagPolicy{}, err
+	}
+	policy.UpdatedAt = &updatedAt
+	return policy, nil
+}
+
+func (s *Store) UpdateRepositoryTagPolicy(ctx context.Context, policy domain.RepositoryTagPolicy, now time.Time) (domain.RepositoryTagPolicy, error) {
+	if policy.RepositoryName == "" {
+		return domain.RepositoryTagPolicy{}, fmt.Errorf("repository name is required")
+	}
+	if _, err := s.GetRepository(ctx, policy.RepositoryName); err != nil {
+		return domain.RepositoryTagPolicy{}, err
+	}
+	if !domain.ValidTagPolicyMode(policy.Mode) {
+		return domain.RepositoryTagPolicy{}, fmt.Errorf("invalid tag policy mode %q", policy.Mode)
+	}
+	if policy.Mode == domain.TagPolicyPattern {
+		if policy.Pattern == "" {
+			return domain.RepositoryTagPolicy{}, fmt.Errorf("tag policy pattern is required")
+		}
+		if _, err := regexp.Compile(policy.Pattern); err != nil {
+			return domain.RepositoryTagPolicy{}, fmt.Errorf("invalid tag policy pattern: %w", err)
+		}
+	} else {
+		policy.Pattern = ""
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO repository_tag_policies (repository_name, mode, pattern, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(repository_name) DO UPDATE SET
+		  mode = excluded.mode,
+		  pattern = excluded.pattern,
+		  updated_at = excluded.updated_at`,
+		policy.RepositoryName, policy.Mode, policy.Pattern, now); err != nil {
+		return domain.RepositoryTagPolicy{}, err
+	}
+	policy.UpdatedAt = &now
+	return policy, nil
 }
 
 func (s *Store) DeleteRepositoryManifestReference(ctx context.Context, repositoryName, reference, digest string) error {
@@ -350,13 +447,16 @@ func (s *Store) DeleteRepositoryManifestReference(ctx context.Context, repositor
 		UPDATE repositories SET
 		  tag_count = (SELECT COUNT(*) FROM repository_tags WHERE repository_name = ?),
 		  manifest_count = (SELECT COUNT(DISTINCT digest) FROM repository_tags WHERE repository_name = ?),
-		  size_bytes = COALESCE((SELECT SUM(size_bytes) FROM repository_tags WHERE repository_name = ?), 0)
+		  size_bytes = COALESCE((SELECT SUM(size_bytes) FROM (SELECT digest, MAX(size_bytes) AS size_bytes FROM repository_tags WHERE repository_name = ? GROUP BY digest)), 0)
 		WHERE name = ?`,
 		repositoryName, repositoryName, repositoryName, repositoryName,
 	); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM repositories WHERE name = ? AND tag_count = 0 AND manifest_count = 0`, repositoryName); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM repository_tag_policies WHERE repository_name = ? AND NOT EXISTS (SELECT 1 FROM repositories WHERE name = ?)`, repositoryName, repositoryName); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -444,8 +544,19 @@ func (s *Store) GetRepository(ctx context.Context, name string) (domain.Reposito
 }
 
 func (s *Store) DeleteRepository(ctx context.Context, name string) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM repositories WHERE name = ?`, name)
-	return requireAffected(result, err)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM repository_tag_policies WHERE repository_name = ?`, name); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM repositories WHERE name = ?`, name)
+	if err := requireAffected(result, err); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ListRepositoryTags(ctx context.Context, repositoryName string) ([]domain.RepositoryTag, error) {

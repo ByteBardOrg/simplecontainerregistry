@@ -49,6 +49,13 @@ CREATE TABLE IF NOT EXISTS repository_tags (
   PRIMARY KEY (repository_name, tag)
 );
 
+CREATE TABLE IF NOT EXISTS repository_tag_policies (
+  repository_name TEXT PRIMARY KEY,
+  mode TEXT NOT NULL CHECK (mode IN ('mutable', 'immutable', 'pattern')),
+  pattern TEXT NOT NULL DEFAULT '',
+  updated_at TIMESTAMP NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_events (
   id TEXT PRIMARY KEY,
   actor_user_id TEXT,
