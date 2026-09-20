@@ -1,9 +1,20 @@
 http:
+  # A non-loopback bind must declare how clients reach SCR. Either set an
+  # https publicURL below, or set allowInsecureHTTP: true to serve plain HTTP.
   address: "0.0.0.0"
   port: 5000
   secureCookies: true
+  allowInsecureHTTP: false
+  # REQUIRED before first start: the public origin clients use, such as
+  # "https://registry.example.com". Pins the bearer-token challenge realm.
   publicURL: ""
+  # Enable only behind a reverse proxy, and list that proxy's networks below.
   trustForwardedHeaders: false
+  trustedProxyCIDRs: []
+  readTimeout: "30m"
+  writeTimeout: "30m"
+  idleTimeout: "2m"
+  maxHeaderBytes: 1048576
 
 storage:
   rootDirectory: "/var/lib/scr/registry"

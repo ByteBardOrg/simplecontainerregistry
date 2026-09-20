@@ -115,20 +115,62 @@ func auditActionsLabel(actions []domain.Action) string {
 }
 
 func (s *Server) requestIP(r *http.Request) string {
-	if s.cfg.HTTP.TrustForwardedHeaders {
+	if s.isTrustedProxy(r.RemoteAddr) {
 		if forwardedFor := r.Header.Get("X-Forwarded-For"); forwardedFor != "" {
-			first, _, _ := strings.Cut(forwardedFor, ",")
-			return strings.TrimSpace(first)
+			if clientIP, ok := s.forwardedClientIP(forwardedFor); ok {
+				return clientIP
+			}
+			return remoteHost(r.RemoteAddr)
 		}
-		if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
-			return realIP
+		if realIP := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); realIP != nil && !s.isTrustedProxyIP(realIP) {
+			return realIP.String()
 		}
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	return remoteHost(r.RemoteAddr)
+}
+
+func remoteHost(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		return remoteAddr
 	}
 	return host
+}
+
+func (s *Server) forwardedClientIP(forwardedFor string) (string, bool) {
+	parts := strings.Split(forwardedFor, ",")
+	for index := len(parts) - 1; index >= 0; index-- {
+		ip := net.ParseIP(strings.TrimSpace(parts[index]))
+		if ip != nil && !s.isTrustedProxyIP(ip) {
+			return ip.String(), true
+		}
+	}
+	return "", false
+}
+
+func (s *Server) isTrustedProxy(remoteAddr string) bool {
+	if !s.cfg.HTTP.TrustForwardedHeaders {
+		return false
+	}
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return false
+	}
+	peer := net.ParseIP(host)
+	if peer == nil {
+		return false
+	}
+	return s.isTrustedProxyIP(peer)
+}
+
+func (s *Server) isTrustedProxyIP(peer net.IP) bool {
+	for _, rawCIDR := range s.cfg.HTTP.TrustedProxyCIDRs {
+		_, cidr, err := net.ParseCIDR(rawCIDR)
+		if err == nil && cidr.Contains(peer) {
+			return true
+		}
+	}
+	return false
 }
 
 func stringPtr(value string) *string {

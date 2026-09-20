@@ -892,26 +892,11 @@ func (s *Server) realm(r *http.Request) string {
 	if r.TLS != nil {
 		proto = "https"
 	}
-	if s.cfg.HTTP.TrustForwardedHeaders {
-		if forwardedProto := firstForwardedValue(r.Header.Get("X-Forwarded-Proto")); forwardedProto == "http" || forwardedProto == "https" {
-			proto = forwardedProto
-		}
-	}
 	host := r.Host
-	if s.cfg.HTTP.TrustForwardedHeaders {
-		if forwardedHost := firstForwardedValue(r.Header.Get("X-Forwarded-Host")); forwardedHost != "" {
-			host = forwardedHost
-		}
-	}
 	if host == "" {
 		host = s.cfg.HTTP.ListenAddress()
 	}
 	return proto + "://" + host + "/token"
-}
-
-func firstForwardedValue(value string) string {
-	first, _, _ := strings.Cut(value, ",")
-	return strings.TrimSpace(first)
 }
 
 func parseRequestedScopes(rawScopes []string) ([]auth.RequestedScope, error) {

@@ -1,10 +1,19 @@
 http:
-  address: "0.0.0.0"
+  # Loopback only. Plain HTTP and insecure cookies need no opt-in here because
+  # the listener is unreachable from outside this machine. Change this address
+  # and you must set an https publicURL or allowInsecureHTTP: true.
+  address: "127.0.0.1"
   port: 5000
   # Set true when accessing SCR through HTTPS, including an HTTPS-terminating reverse proxy.
   secureCookies: false
+  allowInsecureHTTP: false
   publicURL: ""
   trustForwardedHeaders: false
+  trustedProxyCIDRs: []
+  readTimeout: "30m"
+  writeTimeout: "30m"
+  idleTimeout: "2m"
+  maxHeaderBytes: 1048576
 
 storage:
   rootDirectory: "data/registry"

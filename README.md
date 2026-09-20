@@ -15,12 +15,40 @@ Start the registry with the published Docker image:
 
 ```bash
 export SCR_BOOTSTRAP_ADMIN_PASSWORD="$(openssl rand -base64 32)"
+mkdir -p data
+cat > config.local.yaml <<'EOF'
+http:
+  # Docker publishes this container port only on 127.0.0.1 below.
+  address: "0.0.0.0"
+  port: 5000
+  secureCookies: false
+  allowInsecureHTTP: true
+  publicURL: ""
+  trustForwardedHeaders: false
+  trustedProxyCIDRs: []
+  readTimeout: "30m"
+  writeTimeout: "30m"
+  idleTimeout: "2m"
+  maxHeaderBytes: 1048576
+storage:
+  rootDirectory: "/var/lib/scr/registry"
+  gc: true
+  gcDelay: "1h"
+  gcInterval: "24h"
+database:
+  driver: "sqlite"
+  dsn: "/var/lib/scr/scr.db"
+auth:
+  issuer: "scr"
+  service: "scr"
+  tokenTTL: "10m"
+EOF
 docker run --rm --name scr \
   -p 127.0.0.1:5000:5000 \
   -v scr-data:/var/lib/scr \
+  -v "$PWD/config.local.yaml:/etc/scr/config.yaml:ro" \
   -e SCR_BOOTSTRAP_ADMIN_USERNAME=admin \
   -e SCR_BOOTSTRAP_ADMIN_PASSWORD \
-  -e SCR_SECURE_COOKIES=false \
   bytebardorg/simplecontainerregistry:latest
 ```
 
@@ -44,7 +72,7 @@ docker push localhost:5000/getting-started/busybox:latest
 docker pull localhost:5000/getting-started/busybox:latest
 ```
 
-The direct local HTTP example explicitly disables secure cookies and binds only to loopback. For non-local deployments, keep secure cookies enabled and run SCR behind TLS, usually through a reverse proxy.
+The host port is bound only to loopback. This mounted local configuration explicitly opts into insecure HTTP and disables secure cookies. For non-local deployments, keep secure cookies enabled and run SCR behind TLS, usually through a reverse proxy.
 
 ### Deploy with Dokploy
 
@@ -69,8 +97,14 @@ http:
   address: "0.0.0.0"
   port: 5000
   secureCookies: true
+  allowInsecureHTTP: false
   publicURL: ""
   trustForwardedHeaders: false
+  trustedProxyCIDRs: []
+  readTimeout: "30m"
+  writeTimeout: "30m"
+  idleTimeout: "2m"
+  maxHeaderBytes: 1048576
 
 storage:
   rootDirectory: "/var/lib/scr/registry"
@@ -88,6 +122,8 @@ auth:
   tokenTTL: "10m"
 ```
 
+This secure default intentionally fails validation until you configure an HTTPS `http.publicURL`; this prevents accidentally serving the plaintext listener without an explicit deployment choice. The check applies only to non-loopback binds: when `http.address` is a loopback address the listener cannot be reached off-host, so plain HTTP needs no opt-in there. For direct local HTTP, use `config.local.example.yaml`, which binds `127.0.0.1`. To serve plain HTTP on a reachable address anyway, set `http.allowInsecureHTTP: true` in a mounted configuration file.
+
 To use a custom configuration file, mount it over `/etc/scr/config.yaml`:
 
 ```bash
@@ -103,9 +139,13 @@ docker run --rm --name scr \
 Configuration supports these sections:
 
 - `http.address` and `http.port`
-- `http.secureCookies`; defaults to `true`. Leave enabled when SCR is accessed over HTTPS, including behind an HTTPS-terminating reverse proxy. Set to `false` only when serving the admin UI directly over plain HTTP.
-- `http.publicURL`; optional public origin such as `https://registry.example.com`, used for token-service challenge URLs when SCR is behind a reverse proxy.
-- `http.trustForwardedHeaders`; defaults to `false`. Enable only when SCR is reachable exclusively through a trusted reverse proxy that controls `X-Forwarded-*` headers.
+- `http.secureCookies`; defaults to `true`. Leave enabled when SCR is accessed over HTTPS, including behind an HTTPS-terminating reverse proxy.
+- `http.allowInsecureHTTP`; defaults to `false`. Set to `true` to serve plain HTTP, an `http://` `http.publicURL`, or `secureCookies: false` on a non-loopback bind. Loopback binds such as `127.0.0.1`, `::1`, and `localhost` do not need this opt-in.
+- `http.publicURL`; HTTPS public origin such as `https://registry.example.com`, used as the canonical token-service challenge URL. It is required on non-loopback binds unless `http.allowInsecureHTTP` is explicitly enabled. When it is empty, the challenge realm falls back to the request `Host` header, so leave it empty only for loopback binds.
+- `http.trustForwardedHeaders`; defaults to `false`. When enabled, requires an HTTPS `http.publicURL` and non-empty `http.trustedProxyCIDRs`.
+- `http.trustedProxyCIDRs`; CIDRs of reverse proxies allowed to supply `X-Forwarded-For` or `X-Real-IP` for audit and client address handling. Entries must be properly masked network prefixes and may not be `0.0.0.0/0` or `::/0`, since trusting every peer would let any client forge its own address.
+- `http.readTimeout`, `http.writeTimeout`, and `http.idleTimeout`; finite connection limits, defaulting to 30 minutes, 30 minutes, and 2 minutes respectively to accommodate streamed OCI transfers.
+- `http.maxHeaderBytes`; maximum request-header size, defaulting to 1048576 bytes.
 - `storage.rootDirectory`
 - `storage.gc`
 - `storage.gcDelay`
@@ -131,7 +171,7 @@ Bootstrap admin username and password are normally provided with environment var
 - `SCR_BOOTSTRAP_ADMIN_USERNAME`
 - `SCR_BOOTSTRAP_ADMIN_PASSWORD`
 
-If bootstrap admin values are omitted from the config file, SCR fills them from those environment variables. Provide both values together.
+If bootstrap admin values are omitted from the config file, SCR fills them from those environment variables. Provide both values together. The application reads no HTTP configuration from runtime environment variables; configure HTTP settings in the mounted YAML file. Compose variables are expanded by Compose while it generates that file.
 
 ### Admin UI cookies and reverse proxies
 
@@ -139,9 +179,9 @@ SCR stores admin UI sessions in an `HttpOnly`, `SameSite=Lax` cookie. By default
 
 Keep `http.secureCookies: true` for production deployments, including the common setup where a reverse proxy terminates HTTPS and forwards plain HTTP to SCR. The browser only sees the public HTTPS URL, so the `Secure` cookie works normally even if the proxy-to-SCR hop is HTTP.
 
-When SCR is behind a reverse proxy, prefer setting `http.publicURL` to the public registry origin. Only enable `http.trustForwardedHeaders` if direct client traffic cannot reach SCR and the proxy overwrites untrusted `X-Forwarded-For`, `X-Forwarded-Host`, and `X-Forwarded-Proto` input.
+When SCR is behind a reverse proxy, set `http.publicURL` to the HTTPS public registry origin. To retain forwarded client IPs in audit records, set `http.trustForwardedHeaders: true` and list only the proxy networks in `http.trustedProxyCIDRs`; SCR ignores forwarded client-address headers from every other peer. SCR evaluates `X-Forwarded-For` right-to-left and skips trusted proxy addresses, but the proxy must still strip or overwrite client-supplied forwarding headers and direct client access to the backend must be network-isolated. Bearer challenges always use the configured canonical public URL and never use forwarded host or protocol headers.
 
-Set `http.secureCookies: false` only when users access SCR directly over plain HTTP, such as a local development instance or a trusted internal HTTP-only deployment. Do not disable it for an HTTPS reverse-proxy deployment.
+Set `http.secureCookies: false` only when users access SCR directly over plain HTTP, such as a local development instance or a trusted internal HTTP-only deployment. On a non-loopback bind this also requires `http.allowInsecureHTTP: true`; existing direct HTTP configurations that disable secure cookies, or that use an `http://` public URL, must add that explicit opt-in. Loopback binds are exempt because the listener is unreachable from other hosts. Do not disable secure cookies for an HTTPS reverse-proxy deployment, including one that proxies to a loopback bind on the same host: the browser sees HTTPS and the `Secure` flag still belongs on the cookie.
 
 ## Authentication and access
 
@@ -158,8 +198,8 @@ Access model:
 - Each user is the login identity and access secret.
 - User creation returns the secret once.
 - Reader users need repository-prefix grants for pull, push, or delete access.
-- Repository grants can target `*` for all repositories or a simple repository string prefix such as `shieldedstack/`.
-- Grant prefixes are string-prefix matches, not glob or regex patterns. For example, `team/` matches repositories under that namespace, while `team/app` also matches names beginning with `team/app`.
+- Repository grants can target `*` for all repositories or a repository name/namespace such as `shieldedstack/`.
+- Non-wildcard grant prefixes match the exact repository or slash-delimited descendants, not glob or regex patterns. For example, `team/` matches repositories under that namespace, while `team/app` matches `team/app` and `team/app/api` but not `team/application`.
 - Admin users can request repository access without grants.
 - Users may have an optional valid-from date and optional expiry date.
 - Token validation re-checks current user status and validity, so disabled, future-valid, and expired users are rejected even if a token was issued earlier.

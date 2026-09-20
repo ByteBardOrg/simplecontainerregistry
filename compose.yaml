@@ -20,12 +20,20 @@ volumes:
 configs:
   registry-config:
     content: |
+      # The container binds 0.0.0.0, so SCR_PUBLIC_URL must be set to the public
+      # https origin. To serve plain HTTP instead, set SCR_ALLOW_INSECURE_HTTP=true.
       http:
         address: "${SCR_HTTP_ADDRESS:-0.0.0.0}"
         port: ${SCR_HTTP_PORT:-5000}
         secureCookies: ${SCR_SECURE_COOKIES:-true}
+        allowInsecureHTTP: ${SCR_ALLOW_INSECURE_HTTP:-false}
         publicURL: "${SCR_PUBLIC_URL:-}"
         trustForwardedHeaders: ${SCR_TRUST_FORWARDED_HEADERS:-false}
+        trustedProxyCIDRs: [${SCR_TRUSTED_PROXY_CIDRS:-}]
+        readTimeout: "${SCR_HTTP_READ_TIMEOUT:-30m}"
+        writeTimeout: "${SCR_HTTP_WRITE_TIMEOUT:-30m}"
+        idleTimeout: "${SCR_HTTP_IDLE_TIMEOUT:-2m}"
+        maxHeaderBytes: ${SCR_HTTP_MAX_HEADER_BYTES:-1048576}
 
       storage:
         rootDirectory: "${SCR_STORAGE_ROOT_DIRECTORY:-/var/lib/scr/registry}"

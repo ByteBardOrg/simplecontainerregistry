@@ -79,11 +79,7 @@ func main() {
 		Interval: cfg.Storage.GCInterval.Std(),
 	})
 
-	httpServer := &http.Server{
-		Addr:              cfg.HTTP.ListenAddress(),
-		Handler:           server,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	httpServer := newHTTPServer(cfg, server)
 
 	go func() {
 		logger.Info("starting server", "address", httpServer.Addr)
@@ -100,6 +96,18 @@ func main() {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown failed", "error", err)
 		os.Exit(1)
+	}
+}
+
+func newHTTPServer(cfg config.Config, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              cfg.HTTP.ListenAddress(),
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       cfg.HTTP.ReadTimeout.Std(),
+		WriteTimeout:      cfg.HTTP.WriteTimeout.Std(),
+		IdleTimeout:       cfg.HTTP.IdleTimeout.Std(),
+		MaxHeaderBytes:    cfg.HTTP.MaxHeaderBytes,
 	}
 }
 

@@ -104,7 +104,8 @@ func repositoryMatches(repository, prefix string) bool {
 	if prefix == "" {
 		return false
 	}
-	return repository == strings.TrimSuffix(prefix, "/") || strings.HasPrefix(repository, prefix)
+	prefix = strings.TrimSuffix(prefix, "/")
+	return repository == prefix || strings.HasPrefix(repository, prefix+"/")
 }
 
 func uniqueActions(actions []domain.Action) []domain.Action {
