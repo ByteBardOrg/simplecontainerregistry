@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -24,11 +25,30 @@ var (
 )
 
 type Filesystem struct {
-	root string
+	root        string
+	uploadLocks *uploadLockSet
+}
+
+// uploadLockSet keeps locks only while an upload operation is in progress.
+// The reference count lets cleanup coordinate with upload lifecycle operations
+// without retaining one mutex for every upload ever created.
+type uploadLockSet struct {
+	mu    sync.Mutex
+	locks map[string]*uploadLock
+}
+
+type uploadLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 type GCResult struct {
 	DeletedManifests int
+}
+
+// UploadCleanupResult describes expired resumable uploads removed from storage.
+type UploadCleanupResult struct {
+	DeletedUploads int
 }
 
 type Descriptor struct {
@@ -43,7 +63,32 @@ func NewFilesystem(root string) (Filesystem, error) {
 	if err := EnsureRoot(root); err != nil {
 		return Filesystem{}, err
 	}
-	return Filesystem{root: root}, nil
+	return Filesystem{root: root, uploadLocks: &uploadLockSet{locks: make(map[string]*uploadLock)}}, nil
+}
+
+// LockUpload serializes lifecycle operations for uploadPath. The returned
+// function must be called when the operation finishes.
+func (fs Filesystem) LockUpload(uploadPath string) func() {
+	locks := fs.uploadLocks
+	locks.mu.Lock()
+	entry := locks.locks[uploadPath]
+	if entry == nil {
+		entry = &uploadLock{}
+		locks.locks[uploadPath] = entry
+	}
+	entry.refs++
+	locks.mu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		locks.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(locks.locks, uploadPath)
+		}
+		locks.mu.Unlock()
+	}
 }
 
 func EnsureRoot(root string) error {
@@ -481,6 +526,87 @@ func (fs Filesystem) UploadPath(repository, ownerID, uploadID string) (string, e
 		return "", err
 	}
 	return fs.safeJoin("uploads", repoPath, ownerID, uploadID), nil
+}
+
+// CountUploads returns active upload files for one repository owner.
+func (fs Filesystem) CountUploads(repository, ownerID string) (int, error) {
+	probe, err := fs.UploadPath(repository, ownerID, "probe")
+	if err != nil {
+		return 0, err
+	}
+	entries, err := os.ReadDir(filepath.Dir(probe))
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			count++
+		}
+	}
+	return count, nil
+}
+
+// CleanupStaleUploads removes upload files whose modification time has expired.
+// Empty upload directories are retained so cleanup cannot remove a directory
+// after a new upload has created it but before it opens its upload file.
+func (fs Filesystem) CleanupStaleUploads(cutoff time.Time) (UploadCleanupResult, error) {
+	uploadsRoot := fs.safeJoin("uploads")
+	if _, err := os.Stat(uploadsRoot); os.IsNotExist(err) {
+		return UploadCleanupResult{}, nil
+	} else if err != nil {
+		return UploadCleanupResult{}, err
+	}
+	root, err := filepath.Abs(fs.root)
+	if err != nil {
+		return UploadCleanupResult{}, err
+	}
+	var result UploadCleanupResult
+	err = filepath.WalkDir(uploadsRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, absolute)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("upload path escapes storage root")
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		release := fs.LockUpload(path)
+		// A writer may have refreshed this file after WalkDir observed it.
+		// Inspect its expiry again while holding the same lifecycle lock used by
+		// append, commit, and delete operations.
+		info, err := os.Stat(path)
+		if err == nil && info.ModTime().After(cutoff) {
+			release()
+			return nil
+		}
+		if err != nil && !os.IsNotExist(err) {
+			release()
+			return err
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			release()
+			return err
+		}
+		if err == nil {
+			result.DeletedUploads++
+		}
+		release()
+		return nil
+	})
+	if err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 func (fs Filesystem) HasBlob(digest string) (bool, int64, error) {

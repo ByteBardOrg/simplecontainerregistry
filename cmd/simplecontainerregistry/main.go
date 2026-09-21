@@ -63,21 +63,22 @@ func main() {
 		}
 	}
 
-	server := httpserver.New(httpserver.Options{
-		Config: cfg,
-		Store:  store,
-		Logger: logger,
-	})
 	registryFS, err := storage.NewFilesystem(cfg.Storage.RootDirectory)
 	if err != nil {
 		logger.Error("failed to initialize registry filesystem", "error", err)
 		os.Exit(1)
 	}
+	server := httpserver.New(httpserver.Options{
+		Config:     cfg,
+		Store:      store,
+		Logger:     logger,
+		Filesystem: registryFS,
+	})
 	go runGarbageCollector(ctx, logger, store, registryFS, domain.GCSettings{
 		Enabled:  cfg.Storage.GC,
 		Delay:    cfg.Storage.GCDelay.Std(),
 		Interval: cfg.Storage.GCInterval.Std(),
-	})
+	}, cfg.Storage.UploadTTL.Std())
 
 	httpServer := newHTTPServer(cfg, server)
 
@@ -111,7 +112,8 @@ func newHTTPServer(cfg config.Config, handler http.Handler) *http.Server {
 	}
 }
 
-func runGarbageCollector(ctx context.Context, logger *slog.Logger, store *db.Store, registryFS storage.Filesystem, fallback domain.GCSettings) {
+func runGarbageCollector(ctx context.Context, logger *slog.Logger, store *db.Store, registryFS storage.Filesystem, fallback domain.GCSettings, uploadTTL time.Duration) {
+	go runStaleUploadCleanup(ctx, logger, registryFS, uploadTTL)
 	interval := fallback.Interval
 	if interval <= 0 {
 		interval = 24 * time.Hour
@@ -143,4 +145,33 @@ func runGarbageCollector(ctx context.Context, logger *slog.Logger, store *db.Sto
 			timer.Reset(interval)
 		}
 	}
+}
+
+// runStaleUploadCleanup is deliberately independent of manifest GC settings:
+// disabled or infrequent manifest GC must not retain expired upload sessions.
+func runStaleUploadCleanup(ctx context.Context, logger *slog.Logger, registryFS storage.Filesystem, uploadTTL time.Duration) {
+	ticker := time.NewTicker(uploadCleanupInterval(uploadTTL))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if result, err := registryFS.CleanupStaleUploads(time.Now().UTC().Add(-uploadTTL)); err != nil {
+				logger.Error("stale upload cleanup failed", "error", err)
+			} else if result.DeletedUploads > 0 {
+				logger.Info("stale upload cleanup completed", "deleted_uploads", result.DeletedUploads)
+			}
+		}
+	}
+}
+
+func uploadCleanupInterval(uploadTTL time.Duration) time.Duration {
+	if uploadTTL <= 0 {
+		return time.Hour
+	}
+	if interval := uploadTTL / 2; interval > 0 {
+		return interval
+	}
+	return uploadTTL
 }

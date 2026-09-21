@@ -29,6 +29,10 @@ type Options struct {
 	Config config.Config
 	Store  *db.Store
 	Logger *slog.Logger
+	// Filesystem allows callers that run storage maintenance to share upload
+	// lifecycle locks with the HTTP server. A zero value preserves the
+	// constructor's existing filesystem initialization behavior.
+	Filesystem storage.Filesystem
 }
 
 type Server struct {
@@ -41,15 +45,20 @@ type Server struct {
 	webhooks   *registryWebhookDispatcher
 	authLimits *authAttemptLimiter
 	tagMu      sync.Mutex
+	uploadMu   sync.Mutex
 	mux        *http.ServeMux
 }
 
 var ErrTagOverwriteProtected = errors.New("tag overwrite protected")
 
 func New(opts Options) http.Handler {
-	registryFS, err := storage.NewFilesystem(opts.Config.Storage.RootDirectory)
-	if err != nil {
-		panic(err)
+	registryFS := opts.Filesystem
+	if registryFS.Root() == "" {
+		var err error
+		registryFS, err = storage.NewFilesystem(opts.Config.Storage.RootDirectory)
+		if err != nil {
+			panic(err)
+		}
 	}
 	if err := registryFS.MigrateRepositoryBlobLinks(); err != nil {
 		panic(err)
@@ -371,6 +380,10 @@ func (s *Server) handleUploadStart(w http.ResponseWriter, r *http.Request, route
 		return
 	}
 	digest := r.URL.Query().Get("digest")
+	if requestExceedsLimit(r, s.cfg.Storage.MaxUploadBytes) {
+		writeError(w, http.StatusRequestEntityTooLarge, "upload exceeds configured size limit")
+		return
+	}
 	uploadID, err := ids.New("upl")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create upload")
@@ -386,22 +399,46 @@ func (s *Server) handleUploadStart(w http.ResponseWriter, r *http.Request, route
 		writeError(w, http.StatusInternalServerError, "failed to create upload")
 		return
 	}
+	releaseUpload := s.registryFS.LockUpload(uploadPath)
+	defer releaseUpload()
+
+	// This lock protects only the count-and-create critical section. In
+	// particular, it is released before a monolithic request body is copied or
+	// the upload is committed.
+	s.uploadMu.Lock()
+	activeUploads, err := s.registryFS.CountUploads(route.repository, principal.UserID)
+	if err != nil {
+		s.uploadMu.Unlock()
+		writeError(w, http.StatusInternalServerError, "failed to create upload")
+		return
+	}
+	if activeUploads >= s.cfg.Storage.MaxUploadSessions {
+		s.uploadMu.Unlock()
+		writeError(w, http.StatusTooManyRequests, "too many active upload sessions")
+		return
+	}
 	if err := os.MkdirAll(filepath.Dir(uploadPath), 0o750); err != nil {
+		s.uploadMu.Unlock()
 		writeError(w, http.StatusInternalServerError, "failed to create upload")
 		return
 	}
 	file, err := os.OpenFile(uploadPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+	s.uploadMu.Unlock()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create upload")
 		return
 	}
 	if digest != "" {
-		if _, err := io.Copy(file, r.Body); err != nil {
-			_ = file.Close()
+		_ = file.Close()
+		if _, err := appendUpload(uploadPath, r.Body, 0, s.cfg.Storage.MaxUploadBytes); err != nil {
+			_ = os.Remove(uploadPath)
+			if errors.Is(err, errUploadTooLarge) {
+				writeError(w, http.StatusRequestEntityTooLarge, "upload exceeds configured size limit")
+				return
+			}
 			writeError(w, http.StatusInternalServerError, "failed to write upload")
 			return
 		}
-		_ = file.Close()
 		s.commitBlobUpload(w, r, route.repository, uploadPath, digest)
 		return
 	}
@@ -420,6 +457,8 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, route regi
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	releaseUpload := s.registryFS.LockUpload(uploadPath)
+	defer releaseUpload()
 	switch r.Method {
 	case http.MethodPatch:
 		currentSize, err := uploadSize(uploadPath)
@@ -432,8 +471,16 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, route regi
 			writeError(w, http.StatusRequestedRangeNotSatisfiable, err.Error())
 			return
 		}
-		size, err := appendUpload(uploadPath, r.Body)
+		if requestExceedsLimit(r, s.cfg.Storage.MaxUploadBytes-currentSize) {
+			writeError(w, http.StatusRequestEntityTooLarge, "upload exceeds configured size limit")
+			return
+		}
+		size, err := appendUpload(uploadPath, r.Body, currentSize, s.cfg.Storage.MaxUploadBytes)
 		if err != nil {
+			if errors.Is(err, errUploadTooLarge) {
+				writeError(w, http.StatusRequestEntityTooLarge, "upload exceeds configured size limit")
+				return
+			}
 			writeError(w, http.StatusInternalServerError, "failed to append upload")
 			return
 		}
@@ -449,7 +496,15 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, route regi
 			writeError(w, http.StatusRequestedRangeNotSatisfiable, err.Error())
 			return
 		}
-		if _, err := appendUpload(uploadPath, r.Body); err != nil {
+		if requestExceedsLimit(r, s.cfg.Storage.MaxUploadBytes-currentSize) {
+			writeError(w, http.StatusRequestEntityTooLarge, "upload exceeds configured size limit")
+			return
+		}
+		if _, err := appendUpload(uploadPath, r.Body, currentSize, s.cfg.Storage.MaxUploadBytes); err != nil {
+			if errors.Is(err, errUploadTooLarge) {
+				writeError(w, http.StatusRequestEntityTooLarge, "upload exceeds configured size limit")
+				return
+			}
 			writeError(w, http.StatusInternalServerError, "failed to append upload")
 			return
 		}
@@ -467,6 +522,16 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, route regi
 		}
 		w.Header().Set("Docker-Upload-UUID", route.uploadID)
 		w.Header().Set("Range", uploadRange(size))
+		w.WriteHeader(http.StatusNoContent)
+	case http.MethodDelete:
+		if err := os.Remove(uploadPath); err != nil {
+			if os.IsNotExist(err) {
+				writeError(w, http.StatusNotFound, "upload not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "failed to delete upload")
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -975,7 +1040,7 @@ func parseRegistryRoute(r *http.Request) (registryRoute, bool) {
 			}
 			return registryRoute{repository: repository, kind: registryRouteUploadStart, action: domain.ActionPush}, true
 		}
-		if r.Method != http.MethodPatch && r.Method != http.MethodPut && r.Method != http.MethodGet {
+		if r.Method != http.MethodPatch && r.Method != http.MethodPut && r.Method != http.MethodGet && r.Method != http.MethodDelete {
 			return registryRoute{}, false
 		}
 		return registryRoute{repository: repository, kind: registryRouteUpload, uploadID: uploadID, action: domain.ActionPush}, true
@@ -1124,14 +1189,31 @@ func validateContentRange(raw string, currentSize int64) error {
 	return nil
 }
 
-func appendUpload(path string, body io.Reader) (int64, error) {
+var errUploadTooLarge = errors.New("upload exceeds configured size limit")
+
+func requestExceedsLimit(r *http.Request, remaining int64) bool {
+	return r.ContentLength >= 0 && (remaining < 0 || r.ContentLength > remaining)
+}
+
+func appendUpload(path string, body io.Reader, originalSize, maxSize int64) (int64, error) {
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o640)
 	if err != nil {
 		return 0, err
 	}
 	defer file.Close()
-	if _, err := io.Copy(file, body); err != nil {
+	remaining := maxSize - originalSize
+	if remaining < 0 {
+		return originalSize, errUploadTooLarge
+	}
+	written, err := io.Copy(file, io.LimitReader(body, remaining+1))
+	if err != nil {
 		return 0, err
+	}
+	if written > remaining {
+		if err := file.Truncate(originalSize); err != nil {
+			return 0, err
+		}
+		return originalSize, errUploadTooLarge
 	}
 	info, err := file.Stat()
 	if err != nil {

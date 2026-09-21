@@ -24,6 +24,9 @@ func TestLoadDefaultsWhenConfigMissingFailsClosed(t *testing.T) {
 	if cfg.Storage.RootDirectory != "/var/lib/scr/registry" {
 		t.Fatalf("unexpected default storage root %q", cfg.Storage.RootDirectory)
 	}
+	if cfg.Storage.MaxUploadBytes != 10<<30 || cfg.Storage.MaxUploadSessions != 100 || cfg.Storage.UploadTTL.Std() != 24*time.Hour {
+		t.Fatalf("unexpected default upload limits: %#v", cfg.Storage)
+	}
 	if cfg.Database.DSN != "/var/lib/scr/scr.db" {
 		t.Fatalf("unexpected default database dsn %q", cfg.Database.DSN)
 	}
@@ -202,5 +205,22 @@ func TestValidateAcceptsNarrowProxyCIDRs(t *testing.T) {
 	cfg.HTTP.TrustedProxyCIDRs = []string{"10.0.0.0/8", "192.168.1.0/24", "fd00::/64", "127.0.0.1/32"}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestValidateRejectsNonPositiveUploadLimits(t *testing.T) {
+	for _, mutate := range []func(*Config){
+		func(cfg *Config) { cfg.Storage.MaxUploadBytes = 0 },
+		func(cfg *Config) { cfg.Storage.MaxUploadSessions = 0 },
+		func(cfg *Config) { cfg.Storage.UploadTTL = 0 },
+	} {
+		cfg := Default()
+		if cfg.HTTP.Address == "0.0.0.0" {
+			cfg.HTTP.AllowInsecureHTTP = true
+		}
+		mutate(&cfg)
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() error = nil")
+		}
 	}
 }

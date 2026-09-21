@@ -70,6 +70,140 @@ func TestCollectGarbageDeletesOnlyOldUntaggedManifests(t *testing.T) {
 	}
 }
 
+func TestCleanupStaleUploadsDeletesExpiredFilesAndRetainsEmptyParents(t *testing.T) {
+	fs, err := NewFilesystem(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFilesystem() error = %v", err)
+	}
+	oldPath, err := fs.UploadPath("team/app", "owner", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recentPath, err := fs.UploadPath("team/app", "owner", "recent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(oldPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldPath, []byte("old"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(recentPath, []byte("recent"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := os.Chtimes(oldPath, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	result, err := fs.CleanupStaleUploads(now.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("CleanupStaleUploads() error = %v", err)
+	}
+	if result.DeletedUploads != 1 {
+		t.Fatalf("DeletedUploads = %d, want 1", result.DeletedUploads)
+	}
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("expired upload still exists: %v", err)
+	}
+	if _, err := os.Stat(recentPath); err != nil {
+		t.Fatalf("recent upload missing: %v", err)
+	}
+	if err := os.Remove(recentPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.CleanupStaleUploads(now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Dir(recentPath)); err != nil {
+		t.Fatalf("empty upload parent missing: %v", err)
+	}
+}
+
+func TestCleanupStaleUploadsCannotRemoveNewUploadParentBeforeCreate(t *testing.T) {
+	fs, err := NewFilesystem(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPath, err := fs.UploadPath("team/app", "owner", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPath, err := fs.UploadPath("team/app", "owner", "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldPath, []byte("old"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := os.Chtimes(oldPath, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fs.CleanupStaleUploads(now.Add(-time.Hour)); err != nil {
+		t.Fatalf("CleanupStaleUploads() error = %v", err)
+	}
+	file, err := os.OpenFile(newPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+	if err != nil {
+		t.Fatalf("OpenFile(new upload) after cleanup = %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close(new upload) error = %v", err)
+	}
+}
+
+func TestCleanupStaleUploadsRechecksExpiryWhileUploadIsLocked(t *testing.T) {
+	fs, err := NewFilesystem(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := fs.UploadPath("team/app", "owner", "active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("active"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := os.Chtimes(path, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	release := fs.LockUpload(path)
+	done := make(chan UploadCleanupResult, 1)
+	errs := make(chan error, 1)
+	go func() {
+		result, err := fs.CleanupStaleUploads(now.Add(-time.Hour))
+		done <- result
+		errs <- err
+	}()
+	select {
+	case <-done:
+		t.Fatal("cleanup did not wait for active upload")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := os.Chtimes(path, now, now); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if err := <-errs; err != nil {
+		t.Fatal(err)
+	}
+	if result := <-done; result.DeletedUploads != 0 {
+		t.Fatalf("DeletedUploads = %d, want 0", result.DeletedUploads)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("active upload was removed: %v", err)
+	}
+}
+
 func TestCommitBlobFromUploadSupportsSHA512(t *testing.T) {
 	fs, err := NewFilesystem(t.TempDir())
 	if err != nil {

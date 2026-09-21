@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"simplecontainerregistry/internal/config"
 	"simplecontainerregistry/internal/db"
 	"simplecontainerregistry/internal/domain"
+	"simplecontainerregistry/internal/storage"
 )
 
 func TestHTTPTokenAndAdminFlow(t *testing.T) {
@@ -121,6 +123,174 @@ func TestHTTPTokenAndAdminFlow(t *testing.T) {
 	}
 	if !slices.Contains(actions, "user.created") {
 		t.Fatalf("expected user.created audit event, got %#v", actions)
+	}
+}
+
+func TestAppendUploadEnforcesCumulativeLimitWithoutGrowingSession(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "upload")
+	if err := os.WriteFile(path, []byte("abc"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	size, err := appendUpload(path, io.LimitReader(strings.NewReader("defgh"), 5), 3, 5)
+	if !errors.Is(err, errUploadTooLarge) {
+		t.Fatalf("appendUpload() error = %v, want size-limit error", err)
+	}
+	if size != 3 {
+		t.Fatalf("appendUpload() size = %d, want original size 3", size)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "abc" {
+		t.Fatalf("over-limit upload changed resumable session to %q", content)
+	}
+	if size, err := appendUpload(path, strings.NewReader("de"), 3, 5); err != nil || size != 5 {
+		t.Fatalf("boundary append = (%d, %v), want (5, nil)", size, err)
+	}
+}
+
+func TestRegistryUploadResourceLimits(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.Storage.RootDirectory = filepath.Join(t.TempDir(), "registry")
+	cfg.Database.DSN = filepath.Join(t.TempDir(), "test.db")
+	cfg.Storage.MaxUploadBytes = 3
+	cfg.Storage.MaxUploadSessions = 1
+	store, err := db.Open(ctx, cfg.Database.DSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.InitSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureActiveSigningKey(ctx); err != nil {
+		t.Fatal(err)
+	}
+	createHTTPTestUser(t, ctx, store, "limits-admin", "Limits Admin", domain.RoleAdmin, "secret", time.Now().UTC())
+	handler := New(Options{Config: cfg, Store: store})
+	token := requestToken(t, handler, "limits-admin", "secret", "repository:team/app:push")
+
+	start := authenticatedRequest(handler, http.MethodPost, "/v2/team/app/blobs/uploads/", token, nil)
+	if start.Code != http.StatusAccepted {
+		t.Fatalf("start status = %d", start.Code)
+	}
+	location := start.Header().Get("Location")
+	if got := authenticatedRequest(handler, http.MethodPost, "/v2/team/app/blobs/uploads/", token, nil); got.Code != http.StatusTooManyRequests {
+		t.Fatalf("session cap status = %d, want 429", got.Code)
+	}
+	if got := authenticatedRequest(handler, http.MethodPatch, location, token, strings.NewReader("four")); got.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("known-length patch status = %d, want 413", got.Code)
+	}
+	unknown := io.LimitReader(strings.NewReader("four"), 4)
+	if got := authenticatedRequest(handler, http.MethodPut, location+"?digest="+sha256Digest([]byte("four")), token, unknown); got.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("unknown-length terminal put status = %d, want 413", got.Code)
+	}
+	if got := authenticatedRequest(handler, http.MethodGet, location, token, nil); got.Code != http.StatusNoContent || got.Header().Get("Range") != "0-0" {
+		t.Fatalf("over-limit requests changed resumable upload: status=%d range=%q", got.Code, got.Header().Get("Range"))
+	}
+	otherToken := requestToken(t, handler, "limits-admin", "secret", "repository:team/other:push")
+	if got := authenticatedRequest(handler, http.MethodPost, "/v2/team/other/blobs/uploads/", otherToken, nil); got.Code != http.StatusAccepted {
+		t.Fatalf("repository-isolated session status = %d, want 202", got.Code)
+	}
+	if got := authenticatedRequest(handler, http.MethodPost, "/v2/team/app/blobs/uploads/?digest="+sha256Digest([]byte("four")), token, strings.NewReader("four")); got.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("known-length monolithic status = %d, want 413", got.Code)
+	}
+}
+
+func TestSlowMonolithicUploadDoesNotBlockIndependentUploadStart(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.Storage.RootDirectory = filepath.Join(t.TempDir(), "registry")
+	cfg.Database.DSN = filepath.Join(t.TempDir(), "test.db")
+	store, err := db.Open(ctx, cfg.Database.DSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.InitSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureActiveSigningKey(ctx); err != nil {
+		t.Fatal(err)
+	}
+	createHTTPTestUser(t, ctx, store, "slow-upload", "Slow Upload", domain.RoleAdmin, "secret", time.Now().UTC())
+	handler := New(Options{Config: cfg, Store: store})
+	slowToken := requestToken(t, handler, "slow-upload", "secret", "repository:team/slow:push")
+	otherToken := requestToken(t, handler, "slow-upload", "secret", "repository:team/other:push")
+
+	reader, writer := io.Pipe()
+	bodyStarted := make(chan struct{})
+	releaseBody := make(chan struct{})
+	go func() {
+		_, _ = writer.Write([]byte("x"))
+		close(bodyStarted)
+		<-releaseBody
+		_ = writer.Close()
+	}()
+	slowResponse := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		slowResponse <- authenticatedRequest(handler, http.MethodPost, "/v2/team/slow/blobs/uploads/?digest="+sha256Digest([]byte("x")), slowToken, reader)
+	}()
+	<-bodyStarted
+
+	started := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		started <- authenticatedRequest(handler, http.MethodPost, "/v2/team/other/blobs/uploads/", otherToken, nil)
+	}()
+	select {
+	case response := <-started:
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("independent upload start = %d, want 202", response.Code)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("independent upload start was blocked by monolithic upload body")
+	}
+	close(releaseBody)
+	if response := <-slowResponse; response.Code != http.StatusCreated {
+		t.Fatalf("slow monolithic upload = %d, want 201", response.Code)
+	}
+}
+
+func TestNewUsesProvidedFilesystemUploadLocks(t *testing.T) {
+	cfg := config.Default()
+	cfg.Storage.RootDirectory = filepath.Join(t.TempDir(), "registry")
+	registryFS, err := storage.NewFilesystem(cfg.Storage.RootDirectory)
+	if err != nil {
+		t.Fatalf("NewFilesystem() error = %v", err)
+	}
+	handler := New(Options{Config: cfg, Filesystem: registryFS})
+	server, ok := handler.(*Server)
+	if !ok {
+		t.Fatalf("New() returned %T, want *Server", handler)
+	}
+
+	uploadPath, err := registryFS.UploadPath("team/app", "user", "upload")
+	if err != nil {
+		t.Fatalf("UploadPath() error = %v", err)
+	}
+	serverRelease := server.registryFS.LockUpload(uploadPath)
+
+	attempted := make(chan struct{})
+	acquired := make(chan struct{})
+	go func() {
+		close(attempted)
+		release := registryFS.LockUpload(uploadPath)
+		close(acquired)
+		release()
+	}()
+	<-attempted
+	select {
+	case <-acquired:
+		t.Fatal("provided filesystem did not share the server upload lock")
+	case <-time.After(50 * time.Millisecond):
+	}
+	serverRelease()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("provided filesystem upload lock was not released")
 	}
 }
 

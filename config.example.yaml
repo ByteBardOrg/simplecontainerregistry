@@ -21,6 +21,10 @@ storage:
   gc: true
   gcDelay: "1h"
   gcInterval: "24h"
+  # Per-blob cumulative limit, per owner/repository active sessions, and session lifetime.
+  maxUploadBytes: 10737418240
+  maxUploadSessions: 100
+  uploadTTL: "24h"
 
 database:
   driver: "sqlite"

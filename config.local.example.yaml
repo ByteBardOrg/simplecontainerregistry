@@ -20,6 +20,9 @@ storage:
   gc: true
   gcDelay: "1h"
   gcInterval: "24h"
+  maxUploadBytes: 10737418240
+  maxUploadSessions: 100
+  uploadTTL: "24h"
 
 database:
   driver: "sqlite"

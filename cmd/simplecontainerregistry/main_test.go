@@ -19,3 +19,12 @@ func TestNewHTTPServerAppliesConfiguredLimits(t *testing.T) {
 		t.Fatalf("unexpected HTTP server limits: %#v", server)
 	}
 }
+
+func TestUploadCleanupIntervalIsBoundedByUploadTTL(t *testing.T) {
+	if got := uploadCleanupInterval(10 * time.Minute); got != 5*time.Minute {
+		t.Fatalf("uploadCleanupInterval() = %s, want 5m", got)
+	}
+	if got := uploadCleanupInterval(time.Nanosecond); got != time.Nanosecond {
+		t.Fatalf("uploadCleanupInterval(nanosecond) = %s, want 1ns", got)
+	}
+}

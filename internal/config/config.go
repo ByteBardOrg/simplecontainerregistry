@@ -36,10 +36,13 @@ type HTTPConfig struct {
 }
 
 type StorageConfig struct {
-	RootDirectory string   `yaml:"rootDirectory"`
-	GC            bool     `yaml:"gc"`
-	GCDelay       Duration `yaml:"gcDelay"`
-	GCInterval    Duration `yaml:"gcInterval"`
+	RootDirectory     string   `yaml:"rootDirectory"`
+	GC                bool     `yaml:"gc"`
+	GCDelay           Duration `yaml:"gcDelay"`
+	GCInterval        Duration `yaml:"gcInterval"`
+	MaxUploadBytes    int64    `yaml:"maxUploadBytes"`
+	MaxUploadSessions int      `yaml:"maxUploadSessions"`
+	UploadTTL         Duration `yaml:"uploadTTL"`
 }
 
 type DatabaseConfig struct {
@@ -102,10 +105,13 @@ func Default() Config {
 			MaxHeaderBytes: 1 << 20,
 		},
 		Storage: StorageConfig{
-			RootDirectory: "/var/lib/scr/registry",
-			GC:            true,
-			GCDelay:       Duration(time.Hour),
-			GCInterval:    Duration(24 * time.Hour),
+			RootDirectory:     "/var/lib/scr/registry",
+			GC:                true,
+			GCDelay:           Duration(time.Hour),
+			GCInterval:        Duration(24 * time.Hour),
+			MaxUploadBytes:    10 << 30,
+			MaxUploadSessions: 100,
+			UploadTTL:         Duration(24 * time.Hour),
 		},
 		Database: DatabaseConfig{
 			Driver: "sqlite",
@@ -181,6 +187,15 @@ func (c Config) Validate() error {
 	}
 	if c.Storage.RootDirectory == "" {
 		return fmt.Errorf("storage.rootDirectory is required")
+	}
+	if c.Storage.MaxUploadBytes <= 0 {
+		return fmt.Errorf("storage.maxUploadBytes must be positive")
+	}
+	if c.Storage.MaxUploadSessions <= 0 {
+		return fmt.Errorf("storage.maxUploadSessions must be positive")
+	}
+	if c.Storage.UploadTTL <= 0 {
+		return fmt.Errorf("storage.uploadTTL must be positive")
 	}
 	if c.Database.Driver != "sqlite" {
 		return fmt.Errorf("unsupported database.driver %q", c.Database.Driver)

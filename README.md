@@ -35,6 +35,9 @@ storage:
   gc: true
   gcDelay: "1h"
   gcInterval: "24h"
+  maxUploadBytes: 10737418240
+  maxUploadSessions: 100
+  uploadTTL: "24h"
 database:
   driver: "sqlite"
   dsn: "/var/lib/scr/scr.db"
@@ -111,6 +114,9 @@ storage:
   gc: true
   gcDelay: "1h"
   gcInterval: "24h"
+  maxUploadBytes: 10737418240
+  maxUploadSessions: 100
+  uploadTTL: "24h"
 
 database:
   driver: "sqlite"
@@ -150,6 +156,9 @@ Configuration supports these sections:
 - `storage.gc`
 - `storage.gcDelay`
 - `storage.gcInterval`
+- `storage.maxUploadBytes` (default 10 GiB per cumulative blob upload)
+- `storage.maxUploadSessions` (default 100 per owner and repository)
+- `storage.uploadTTL` (default 24h; resumable uploads are removed after this idle lifetime)
 - `database.driver` set to `sqlite`; other database drivers are not supported
 - `database.dsn`
 - `auth.issuer`

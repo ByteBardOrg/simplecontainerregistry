@@ -40,6 +40,9 @@ configs:
         gc: ${SCR_STORAGE_GC:-true}
         gcDelay: "${SCR_STORAGE_GC_DELAY:-1h}"
         gcInterval: "${SCR_STORAGE_GC_INTERVAL:-24h}"
+        maxUploadBytes: ${SCR_STORAGE_MAX_UPLOAD_BYTES:-10737418240}
+        maxUploadSessions: ${SCR_STORAGE_MAX_UPLOAD_SESSIONS:-100}
+        uploadTTL: "${SCR_STORAGE_UPLOAD_TTL:-24h}"
 
       database:
         driver: "sqlite"
