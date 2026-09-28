@@ -35,9 +35,12 @@ jobs:
 
       - name: Start registry
         run: |
+          # OCI conformance connects over plain HTTP; keep the image's secure default.
+          sed 's/^  allowInsecureHTTP: false$/  allowInsecureHTTP: true/' config.container.yaml > "$RUNNER_TEMP/scr-ci-config.yaml"
           docker run -d \
             --name scr-ci \
             -p 5000:5000 \
+            -v "$RUNNER_TEMP/scr-ci-config.yaml:/etc/scr/config.yaml:ro" \
             -e SCR_BOOTSTRAP_ADMIN_USERNAME=admin \
             -e SCR_BOOTSTRAP_ADMIN_PASSWORD=ci-password \
             scr:ci
